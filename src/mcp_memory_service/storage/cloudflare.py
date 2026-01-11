@@ -99,7 +99,802 @@ class CloudflareStorage(MemoryStorage):
         # Embedding cache for performance
         self._embedding_cache = {}
         self._cache_max_size = 1000
-    
+
+    # ========== PHASE 1: Vectorize Metadata Helpers ==========
+
+    def _extract_project_from_tags(self, tags_str: str) -> Optional[str]:
+        """Extract project name from tags string."""
+        if not tags_str:
+            return None
+        for tag in tags_str.split(","):
+            tag = tag.strip()
+            if tag.startswith("project:"):
+                return tag.split(":", 1)[1]
+        return None
+
+    def _extract_status_from_tags(self, tags_str: str) -> Optional[str]:
+        """Extract status from tags string."""
+        if not tags_str:
+            return None
+        for tag in tags_str.split(","):
+            tag = tag.strip()
+            if tag.startswith("status:"):
+                return tag.split(":", 1)[1]
+        return None
+
+    def _extract_type_from_tags(self, tags_str: str) -> Optional[str]:
+        """Extract type from tags string."""
+        if not tags_str:
+            return None
+        for tag in tags_str.split(","):
+            tag = tag.strip()
+            if tag.startswith("type:"):
+                return tag.split(":", 1)[1]
+        return None
+
+    def _build_vectorize_filter(self, filters: Dict[str, Any]) -> Dict[str, Any]:
+        """Build Cloudflare Vectorize filter syntax."""
+        vectorize_filter = {}
+
+        for key, value in filters.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                vectorize_filter[key] = {"$eq": value}
+            elif isinstance(value, list):
+                vectorize_filter[key] = {"$in": value}
+
+        return vectorize_filter
+
+    # ========== PHASE 2: FTS5 + Hybrid Search ==========
+
+    def _escape_fts5_query(self, query: str) -> str:
+        """Escape special FTS5 characters for safe query."""
+        # Remove characters that break FTS5 syntax
+        special_chars = ['"', "'", "(", ")", "*", ":", "-", "+", "^", "~", "[", "]", "{", "}"]
+        for char in special_chars:
+            query = query.replace(char, " ")
+        return " ".join(query.split())  # Normalize whitespace
+
+    async def _fts5_search(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Full-text search using FTS5 (if available in D1).
+
+        Returns list of matches with content_hash, content, and BM25 rank score.
+        Falls back to LIKE search if FTS5 is not available.
+        """
+        safe_query = self._escape_fts5_query(query)
+        if not safe_query.strip():
+            return []
+
+        # Build FTS5 query with wildcards: "word1 word2" -> "word1* word2*"
+        terms = safe_query.split()
+        fts_query = " ".join(f"{term}*" for term in terms if term)
+
+        try:
+            # Try FTS5 search first
+            sql = """
+            SELECT
+                m.content_hash,
+                m.content,
+                m.memory_type,
+                m.created_at_iso,
+                bm25(memories_fts) as rank
+            FROM memories_fts
+            JOIN memories m ON memories_fts.rowid = m.rowid
+            WHERE memories_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+            """
+            payload = {"sql": sql, "params": [fts_query, limit]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                results = result["result"][0]["results"]
+
+                # Normalize BM25 scores to 0-1 range
+                if results:
+                    ranks = [r.get("rank", 0) for r in results]
+                    min_rank = min(ranks)
+                    max_rank = max(ranks)
+                    rank_range = max_rank - min_rank if max_rank != min_rank else 1
+
+                    for r in results:
+                        # BM25: more negative = better match, so invert
+                        r["score"] = 1.0 - ((r.get("rank", 0) - min_rank) / rank_range)
+
+                logger.info(f"FTS5 search found {len(results)} results for query: {query}")
+                return results
+
+        except Exception as e:
+            logger.warning(f"FTS5 search failed, falling back to LIKE search: {e}")
+
+        # Fallback to LIKE search if FTS5 not available
+        return await self._like_search(query, limit)
+
+    async def _like_search(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Fallback keyword search using LIKE when FTS5 is not available."""
+        safe_query = self._escape_fts5_query(query)
+        if not safe_query.strip():
+            return []
+
+        terms = safe_query.split()
+        # Build LIKE conditions for each term
+        like_conditions = " AND ".join([f"content LIKE ?" for _ in terms])
+        params = [f"%{term}%" for term in terms]
+        params.append(limit)
+
+        sql = f"""
+        SELECT
+            content_hash,
+            content,
+            memory_type,
+            created_at_iso,
+            LENGTH(content) as rank
+        FROM memories
+        WHERE {like_conditions}
+        ORDER BY created_at DESC
+        LIMIT ?
+        """
+
+        payload = {"sql": sql, "params": params}
+        response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+        result = response.json()
+
+        if result.get("success") and result.get("result", [{}])[0].get("results"):
+            results = result["result"][0]["results"]
+            # Assign equal scores for LIKE results
+            for r in results:
+                r["score"] = 0.5
+            return results
+
+        return []
+
+    def _reciprocal_rank_fusion(
+        self,
+        result_lists: List[List[Dict[str, Any]]],
+        weights: Optional[List[float]] = None,
+        k: int = 60
+    ) -> List[Dict[str, Any]]:
+        """Merge multiple ranked result lists using Reciprocal Rank Fusion (RRF).
+
+        RRF score = sum(weight / (k + rank)) for each list
+
+        Args:
+            result_lists: List of result lists, each sorted by relevance
+            weights: Weight for each list (default: equal weights)
+            k: Constant to prevent high ranks dominating (default: 60)
+
+        Returns:
+            Merged and re-ranked results
+        """
+        if weights is None:
+            weights = [1.0] * len(result_lists)
+
+        # Normalize weights
+        total_weight = sum(weights)
+        weights = [w / total_weight for w in weights]
+
+        # Calculate RRF scores
+        scores: Dict[str, Dict[str, Any]] = {}
+
+        for list_idx, results in enumerate(result_lists):
+            weight = weights[list_idx]
+            method_name = ["semantic", "keyword"][list_idx] if list_idx < 2 else f"list_{list_idx}"
+
+            for rank, result in enumerate(results, start=1):
+                content_hash = result.get("content_hash")
+                if not content_hash:
+                    continue
+
+                rrf_score = weight / (k + rank)
+
+                if content_hash not in scores:
+                    scores[content_hash] = {
+                        "score": 0.0,
+                        "data": result,
+                        "sources": []
+                    }
+
+                scores[content_hash]["score"] += rrf_score
+                scores[content_hash]["sources"].append({
+                    "method": method_name,
+                    "rank": rank,
+                    "original_score": result.get("score", 0)
+                })
+
+        # Sort by RRF score
+        sorted_results = sorted(
+            scores.values(),
+            key=lambda x: x["score"],
+            reverse=True
+        )
+
+        # Format output
+        return [
+            {
+                **item["data"],
+                "rrf_score": item["score"],
+                "sources": item["sources"]
+            }
+            for item in sorted_results
+        ]
+
+    async def hybrid_retrieve(
+        self,
+        query: str,
+        n_results: int = 10,
+        semantic_weight: float = 0.6,
+        keyword_weight: float = 0.4,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """Hybrid search combining semantic (Vectorize) and keyword (FTS5/LIKE) search.
+
+        Args:
+            query: Search query
+            n_results: Number of results to return
+            semantic_weight: Weight for semantic search (0-1)
+            keyword_weight: Weight for keyword search (0-1)
+            filters: Optional Vectorize metadata filters
+
+        Returns:
+            Merged results with RRF scores and source information
+        """
+        # Fetch more candidates for better fusion
+        candidate_multiplier = 3
+
+        # Run searches in parallel
+        semantic_task = self._semantic_search(
+            query,
+            limit=n_results * candidate_multiplier,
+            filters=filters
+        )
+        keyword_task = self._fts5_search(
+            query,
+            limit=n_results * candidate_multiplier
+        )
+
+        semantic_results, keyword_results = await asyncio.gather(
+            semantic_task,
+            keyword_task
+        )
+
+        logger.info(f"Hybrid search: {len(semantic_results)} semantic + {len(keyword_results)} keyword results")
+
+        # Merge using RRF
+        merged = self._reciprocal_rank_fusion(
+            [semantic_results, keyword_results],
+            weights=[semantic_weight, keyword_weight]
+        )
+
+        return merged[:n_results]
+
+    async def _semantic_search(
+        self,
+        query: str,
+        limit: int,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """Semantic search via Vectorize, returning dicts for RRF fusion."""
+        try:
+            results = await self.retrieve(query, n_results=limit, filters=filters)
+
+            # Convert MemoryQueryResult to dict for RRF
+            return [
+                {
+                    "content_hash": r.memory.content_hash,
+                    "content": r.memory.content,
+                    "memory_type": r.memory.memory_type,
+                    "created_at_iso": r.memory.created_at_iso,
+                    "tags": ",".join(r.memory.tags) if r.memory.tags else "",
+                    "score": r.relevance_score
+                }
+                for r in results
+            ]
+        except Exception as e:
+            logger.error(f"Semantic search failed: {e}")
+            return []
+
+    # ========== PHASE 3: Smart Retrieve with Query Understanding ==========
+
+    async def smart_retrieve(
+        self,
+        query: str,
+        n_results: int = 10,
+        use_hybrid: bool = True
+    ) -> Dict[str, Any]:
+        """Smart retrieval with automatic query understanding.
+
+        Automatically detects:
+        - Project names (freel, mind-space, etc.)
+        - Memory types (task, error, decision)
+        - Time expressions (last week, yesterday)
+        - Status (completed, pending)
+        - Abbreviation expansions
+
+        Args:
+            query: Natural language search query
+            n_results: Number of results to return
+            use_hybrid: Whether to use hybrid search (default True)
+
+        Returns:
+            Dict with 'results' and 'query_understanding' metadata
+        """
+        from ..utils.query_parser import query_parser
+
+        # Parse the query
+        parsed = query_parser.parse(query)
+        logger.info(f"Query parsed: filters={parsed.filters}, time={parsed.time_filter}, intent={parsed.intent}")
+
+        # Build search query with expansions
+        search_query = parsed.cleaned
+        if parsed.expanded_terms:
+            search_query += " " + " ".join(parsed.expanded_terms)
+
+        # Build filters from parsed data
+        filters = parsed.filters if parsed.filters else None
+
+        # Choose search method
+        if use_hybrid:
+            results = await self.hybrid_retrieve(
+                query=search_query,
+                n_results=n_results,
+                filters=filters
+            )
+        else:
+            # Use semantic-only search
+            raw_results = await self.retrieve(
+                query=search_query,
+                n_results=n_results * 2,  # Get more, filter later
+                filters=filters
+            )
+            # Convert to dicts
+            results = [
+                {
+                    "content_hash": r.memory.content_hash,
+                    "content": r.memory.content,
+                    "memory_type": r.memory.memory_type,
+                    "created_at_iso": r.memory.created_at_iso,
+                    "tags": ",".join(r.memory.tags) if r.memory.tags else "",
+                    "score": r.relevance_score
+                }
+                for r in raw_results
+            ]
+
+        # Apply time filter if present
+        if parsed.time_filter and "start_date" in parsed.time_filter:
+            start_date = parsed.time_filter["start_date"]
+            results = [
+                r for r in results
+                if r.get("created_at_iso", "")[:10] >= start_date
+            ]
+
+        # Apply post-filtering for project/type tags (fallback when Vectorize metadata not available)
+        if parsed.filters:
+            project_filter = parsed.filters.get("project")
+            type_filter = parsed.filters.get("type")
+
+            if project_filter or type_filter:
+                filtered_results = []
+                for r in results:
+                    tags = r.get("tags", "")
+                    if isinstance(tags, list):
+                        tags = ",".join(tags)
+                    tags_lower = tags.lower()
+
+                    # Check project filter
+                    if project_filter:
+                        if f"project:{project_filter}" not in tags_lower and project_filter not in tags_lower:
+                            continue
+
+                    # Check type filter
+                    if type_filter:
+                        if f"type:{type_filter}" not in tags_lower and type_filter not in tags_lower:
+                            continue
+
+                    filtered_results.append(r)
+
+                # If we filtered too much, keep some unfiltered results
+                if len(filtered_results) < n_results // 2:
+                    logger.warning(f"Post-filter reduced results from {len(results)} to {len(filtered_results)}, keeping some unfiltered")
+                    # Add unfiltered to reach minimum
+                    for r in results:
+                        if r not in filtered_results:
+                            filtered_results.append(r)
+                        if len(filtered_results) >= n_results:
+                            break
+
+                results = filtered_results
+
+        return {
+            "results": results[:n_results],
+            "query_understanding": {
+                "original": parsed.original,
+                "cleaned": parsed.cleaned,
+                "filters_applied": parsed.filters,
+                "time_filter": parsed.time_filter,
+                "expansions": parsed.expanded_terms,
+                "intent": parsed.intent
+            }
+        }
+
+    async def refresh_query_parser_projects(self) -> int:
+        """Load project names from Memory MCP tags into QueryParser.
+
+        Returns:
+            Number of projects added
+        """
+        from ..utils.query_parser import query_parser
+
+        try:
+            # Get all unique project tags from D1
+            sql = """
+            SELECT DISTINCT tag
+            FROM tags
+            WHERE tag LIKE 'project:%'
+            """
+            payload = {"sql": sql, "params": []}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                results = result["result"][0]["results"]
+                tags = [r.get("tag", "") for r in results if r.get("tag")]
+                added = query_parser.load_projects_from_tags(tags)
+                logger.info(f"Loaded {added} projects from Memory tags into QueryParser")
+                return added
+            return 0
+        except Exception as e:
+            logger.warning(f"Failed to load projects from tags: {e}")
+            return 0
+
+    # ========== PHASE 4: Memory Quality + Deduplication ==========
+
+    async def _find_near_duplicate(
+        self,
+        content: str,
+        threshold: float = 0.95
+    ) -> Optional[Dict[str, Any]]:
+        """Check if similar content already exists in Vectorize.
+
+        Args:
+            content: Content to check for duplicates
+            threshold: Similarity threshold (0.95 = 95% similar)
+
+        Returns:
+            Dict with duplicate info if found, None otherwise
+        """
+        try:
+            # Get embedding for new content
+            embedding = await self._generate_embedding(content)
+
+            # Search for very similar vectors
+            payload = {
+                "vector": embedding,
+                "topK": 3,
+                "returnMetadata": "all",
+                "returnValues": False
+            }
+
+            response = await self._retry_request(
+                "POST",
+                f"{self.vectorize_url}/query",
+                json=payload
+            )
+            result = response.json()
+
+            if result.get("success"):
+                matches = result.get("result", {}).get("matches", [])
+
+                for match in matches:
+                    score = match.get("score", 0)
+                    if score >= threshold:
+                        return {
+                            "hash": match.get("id"),
+                            "score": score,
+                            "metadata": match.get("metadata", {})
+                        }
+
+            return None
+        except Exception as e:
+            logger.warning(f"Near-duplicate check failed: {e}")
+            return None
+
+    async def find_duplicates(
+        self,
+        similarity_threshold: float = 0.90,
+        batch_size: int = 100,
+        max_results: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Find semantically similar memories that may be duplicates.
+
+        Args:
+            similarity_threshold: Minimum similarity to consider duplicate (0-1)
+            batch_size: Number of memories to check per batch
+            max_results: Maximum duplicate pairs to return
+
+        Returns:
+            List of duplicate pairs with similarity scores
+        """
+        duplicates: List[Dict[str, Any]] = []
+        checked_pairs: set = set()
+
+        try:
+            # Get recent memories from D1
+            sql = """
+            SELECT content_hash, content, created_at_iso
+            FROM memories
+            ORDER BY created_at DESC
+            LIMIT ?
+            """
+            payload = {"sql": sql, "params": [batch_size * 5]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if not result.get("success") or not result.get("result", [{}])[0].get("results"):
+                return []
+
+            memories = result["result"][0]["results"]
+
+            for mem in memories:
+                if len(duplicates) >= max_results:
+                    break
+
+                content_hash = mem.get("content_hash", "")
+                content = mem.get("content", "")
+
+                if not content:
+                    continue
+
+                # Get embedding and search for similar
+                try:
+                    embedding = await self._generate_embedding(content)
+
+                    search_payload = {
+                        "vector": embedding,
+                        "topK": 5,
+                        "returnMetadata": "all",
+                        "returnValues": False
+                    }
+
+                    search_response = await self._retry_request(
+                        "POST",
+                        f"{self.vectorize_url}/query",
+                        json=search_payload
+                    )
+                    search_result = search_response.json()
+
+                    if search_result.get("success"):
+                        matches = search_result.get("result", {}).get("matches", [])
+
+                        for match in matches:
+                            match_id = match.get("id", "")
+                            score = match.get("score", 0)
+
+                            # Skip self-match
+                            if match_id == content_hash:
+                                continue
+
+                            # Skip if pair already checked
+                            pair_key = tuple(sorted([content_hash, match_id]))
+                            if pair_key in checked_pairs:
+                                continue
+
+                            checked_pairs.add(pair_key)
+
+                            # Check threshold
+                            if score >= similarity_threshold:
+                                # Get details of duplicate
+                                dup_mem = await self._get_memory_by_hash(match_id)
+
+                                duplicates.append({
+                                    "memory_1": {
+                                        "hash": content_hash,
+                                        "content_preview": content[:200],
+                                        "created_at": mem.get("created_at_iso", "")
+                                    },
+                                    "memory_2": {
+                                        "hash": match_id,
+                                        "content_preview": dup_mem.get("content", "")[:200] if dup_mem else "",
+                                        "created_at": dup_mem.get("created_at_iso", "") if dup_mem else ""
+                                    },
+                                    "similarity": score,
+                                    "recommendation": self._recommend_dedup_action(
+                                        mem.get("created_at_iso", ""),
+                                        dup_mem.get("created_at_iso", "") if dup_mem else "",
+                                        score
+                                    )
+                                })
+
+                except Exception as e:
+                    logger.warning(f"Error checking memory {content_hash}: {e}")
+                    continue
+
+            return duplicates
+
+        except Exception as e:
+            logger.error(f"find_duplicates failed: {e}")
+            return []
+
+    async def _get_memory_by_hash(self, content_hash: str) -> Optional[Dict[str, Any]]:
+        """Get memory details by content hash."""
+        try:
+            sql = "SELECT content, memory_type, created_at_iso FROM memories WHERE content_hash = ?"
+            payload = {"sql": sql, "params": [content_hash]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                results = result["result"][0]["results"]
+                if results:
+                    return results[0]
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to get memory by hash {content_hash}: {e}")
+            return None
+
+    def _recommend_dedup_action(
+        self,
+        date1: str,
+        date2: str,
+        similarity: float
+    ) -> str:
+        """Recommend action for duplicate pair."""
+        # Very similar = keep newer, delete older
+        if similarity >= 0.98:
+            if date1 > date2:
+                return "delete_second"
+            else:
+                return "delete_first"
+
+        # Moderately similar = suggest review
+        if similarity >= 0.90:
+            return "review_and_merge"
+
+        return "keep_both"
+
+    async def consolidate_memories(
+        self,
+        hashes: List[str],
+        keep_hash: str,
+        merge_tags: bool = True
+    ) -> Tuple[bool, str]:
+        """Consolidate multiple memories into one.
+
+        Args:
+            hashes: List of memory hashes to consolidate
+            keep_hash: Hash of memory to keep
+            merge_tags: Whether to merge tags from deleted memories
+
+        Returns:
+            (success, message)
+        """
+        if keep_hash not in hashes:
+            return False, "keep_hash must be in hashes list"
+
+        if len(hashes) < 2:
+            return False, "Need at least 2 hashes to consolidate"
+
+        # Verify all hashes exist
+        for h in hashes:
+            exists = await self._memory_exists(h)
+            if not exists:
+                return False, f"Memory {h} not found"
+
+        # Collect tags from all memories if merging
+        all_tags: set = set()
+        if merge_tags:
+            for h in hashes:
+                tags = await self._get_memory_tags(h)
+                all_tags.update(tags)
+
+        # Delete duplicates (keep keep_hash)
+        deleted = 0
+        for h in hashes:
+            if h != keep_hash:
+                success = await self.delete(h)
+                if success:
+                    deleted += 1
+
+        # Update tags on kept memory if merged
+        if merge_tags and all_tags:
+            await self._update_memory_tags(keep_hash, list(all_tags))
+
+        return True, f"Consolidated {len(hashes)} memories. Deleted {deleted}, kept {keep_hash}"
+
+    async def _memory_exists(self, content_hash: str) -> bool:
+        """Check if memory exists."""
+        try:
+            sql = "SELECT 1 FROM memories WHERE content_hash = ? LIMIT 1"
+            payload = {"sql": sql, "params": [content_hash]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                return len(result["result"][0]["results"]) > 0
+            return False
+        except Exception:
+            return False
+
+    async def _get_memory_tags(self, content_hash: str) -> List[str]:
+        """Get tags for a memory."""
+        try:
+            sql = """
+            SELECT t.tag
+            FROM tags t
+            JOIN memory_tags mt ON t.id = mt.tag_id
+            JOIN memories m ON mt.memory_id = m.id
+            WHERE m.content_hash = ?
+            """
+            payload = {"sql": sql, "params": [content_hash]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                return [r.get("tag", "") for r in result["result"][0]["results"]]
+            return []
+        except Exception:
+            return []
+
+    async def cleanup_old_duplicates(
+        self,
+        max_age_days: int = 90,
+        similarity_threshold: float = 0.98,
+        dry_run: bool = True
+    ) -> Dict[str, Any]:
+        """Automatically clean up old near-duplicates.
+
+        Args:
+            max_age_days: Only process memories older than this
+            similarity_threshold: Only auto-delete if similarity >= this
+            dry_run: If True, only report what would be deleted
+
+        Returns:
+            Summary of cleanup actions
+        """
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).strftime("%Y-%m-%d")
+
+        # Find duplicates with high threshold
+        duplicates = await self.find_duplicates(
+            similarity_threshold=similarity_threshold,
+            max_results=1000
+        )
+
+        # Filter to old ones
+        old_duplicates = [
+            d for d in duplicates
+            if d["memory_2"]["created_at"][:10] < cutoff_date
+        ]
+
+        results: Dict[str, Any] = {
+            "total_found": len(duplicates),
+            "old_duplicates": len(old_duplicates),
+            "would_delete": [],
+            "deleted": []
+        }
+
+        for dup in old_duplicates:
+            # Prefer keeping newer
+            if dup["memory_1"]["created_at"] > dup["memory_2"]["created_at"]:
+                to_delete = dup["memory_2"]["hash"]
+                to_keep = dup["memory_1"]["hash"]
+            else:
+                to_delete = dup["memory_1"]["hash"]
+                to_keep = dup["memory_2"]["hash"]
+
+            if dry_run:
+                results["would_delete"].append({
+                    "delete": to_delete,
+                    "keep": to_keep,
+                    "similarity": dup["similarity"]
+                })
+            else:
+                success = await self.delete(to_delete)
+                if success:
+                    results["deleted"].append(to_delete)
+
+        return results
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client with connection pooling."""
         if self.client is None:
@@ -285,12 +1080,25 @@ class CloudflareStorage(MemoryStorage):
             if e.response.status_code == 404:
                 raise ValueError(f"R2 bucket '{self.r2_bucket}' not found")
             raise
-    
+
     async def store(self, memory: Memory) -> Tuple[bool, str]:
-        """Store a memory in Cloudflare storage."""
+        """Store a memory in Cloudflare storage.
+
+        Includes auto-dedup warning: if similar content exists (>90% similarity),
+        the memory is still stored but returns a warning in the message.
+        """
         try:
             # Generate embedding for the content
             embedding = await self._generate_embedding(memory.content)
+
+            # IMPROVEMENT #4: Check for near-duplicates (warning only, no blocking)
+            duplicate_warning = ""
+            try:
+                similar = await self._find_near_duplicate(memory.content, threshold=0.90)
+                if similar:
+                    duplicate_warning = f" ⚠️ WARNING: Similar content exists (similarity: {similar['score']:.1%}). Consider reviewing: {similar['hash'][:16]}..."
+            except Exception as e:
+                logger.debug(f"Duplicate check skipped: {e}")
             
             # Determine storage strategy based on content size
             content_size = len(memory.content.encode('utf-8'))
@@ -305,22 +1113,30 @@ class CloudflareStorage(MemoryStorage):
                 await self._store_r2_content(r2_key, memory.content)
                 stored_content = f"[R2 Content: {r2_key}]"  # Placeholder in D1
             
-            # Store vector in Vectorize
+            # Store vector in Vectorize with enhanced metadata for filtering
             vector_id = memory.content_hash
+            tags_str = ",".join(memory.tags) if memory.tags else ""
+            created_at_iso = memory.created_at_iso or datetime.now().isoformat()
+
             vector_metadata = {
                 "content_hash": memory.content_hash,
                 "memory_type": memory.memory_type or "standard",
-                "tags": ",".join(memory.tags) if memory.tags else "",
-                "created_at": memory.created_at_iso or datetime.now().isoformat()
+                "tags": tags_str,
+                "created_at": created_at_iso,
+                # PHASE 1: Enhanced metadata for Vectorize filtering
+                "project": self._extract_project_from_tags(tags_str),
+                "type": memory.memory_type or self._extract_type_from_tags(tags_str),
+                "status": self._extract_status_from_tags(tags_str),
+                "date": created_at_iso[:10] if created_at_iso else None  # YYYY-MM-DD
             }
-            
+
             await self._store_vectorize_vector(vector_id, embedding, vector_metadata)
             
             # Store metadata in D1
             await self._store_d1_memory(memory, vector_id, content_size, r2_key, stored_content)
             
             logger.info(f"Successfully stored memory: {memory.content_hash}")
-            return True, f"Memory stored successfully (vector_id: {vector_id})"
+            return True, f"Memory stored successfully (vector_id: {vector_id}){duplicate_warning}"
             
         except Exception as e:
             logger.error(f"Failed to store memory {memory.content_hash}: {e}")
@@ -445,20 +1261,66 @@ class CloudflareStorage(MemoryStorage):
         if response.status_code not in [200, 201]:
             raise ValueError(f"Failed to store content in R2: {response.status_code}")
     
-    async def retrieve(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
-        """Retrieve memories by semantic search."""
+    async def retrieve(
+        self,
+        query: str,
+        n_results: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+        smart: bool = True
+    ) -> List[MemoryQueryResult]:
+        """Retrieve memories by semantic search with optional metadata filtering.
+
+        Args:
+            query: Search query text
+            n_results: Number of results to return
+            filters: Optional metadata filters (e.g., {"project": "freel", "type": "task"})
+            smart: Use smart query understanding + hybrid search (default True)
+
+        Returns:
+            List of MemoryQueryResult objects
+        """
+        # IMPROVEMENT #1: Smart retrieve as default
+        if smart:
+            try:
+                smart_results = await self.smart_retrieve(query, n_results, use_hybrid=True)
+                # Convert smart_retrieve dict results to MemoryQueryResult objects
+                results = []
+                for r in smart_results.get("results", []):
+                    memory = Memory(
+                        content=r.get("content", ""),
+                        content_hash=r.get("content_hash", ""),
+                        memory_type=r.get("memory_type"),
+                        created_at_iso=r.get("created_at_iso"),
+                        tags=r.get("tags", "").split(",") if r.get("tags") else []
+                    )
+                    results.append(MemoryQueryResult(
+                        memory=memory,
+                        relevance_score=r.get("rrf_score", r.get("score", 0.0))
+                    ))
+                return results[:n_results]
+            except Exception as e:
+                logger.warning(f"Smart retrieve failed, falling back to semantic: {e}")
+                # Fall through to semantic-only search
+
         try:
             # Generate query embedding
             query_embedding = await self._generate_embedding(query)
-            
-            # Search Vectorize (without namespace for now)
+
+            # Search Vectorize with optional filtering
             search_payload = {
                 "vector": query_embedding,
                 "topK": n_results,
                 "returnMetadata": "all",
                 "returnValues": False
             }
-            
+
+            # PHASE 1: Add metadata filter if provided
+            if filters:
+                vectorize_filter = self._build_vectorize_filter(filters)
+                if vectorize_filter:
+                    search_payload["filter"] = vectorize_filter
+                    logger.info(f"Applying Vectorize filter: {vectorize_filter}")
+
             response = await self._retry_request("POST", f"{self.vectorize_url}/query", json=search_payload)
             result = response.json()
             
@@ -885,8 +1747,24 @@ class CloudflareStorage(MemoryStorage):
         if new_tags:
             await self._store_d1_tags(memory_id, new_tags)
     
+    async def _get_vectorize_index_info(self) -> Dict[str, Any]:
+        """Get Vectorize index info including actual vector count.
+
+        PHASE 1: Fix stats bug - get real vector count from Vectorize API.
+        """
+        try:
+            response = await self._retry_request("GET", f"{self.vectorize_url}")
+            result = response.json()
+
+            if result.get("success") and result.get("result"):
+                return result["result"]
+            return {}
+        except Exception as e:
+            logger.warning(f"Failed to get Vectorize index info: {e}")
+            return {}
+
     async def get_stats(self) -> Dict[str, Any]:
-        """Get storage statistics."""
+        """Get storage statistics with accurate vector count from Vectorize API."""
         try:
             # Calculate timestamp for memories from last 7 days
             week_ago = time.time() - (7 * 24 * 60 * 60)
@@ -896,7 +1774,6 @@ class CloudflareStorage(MemoryStorage):
             SELECT
                 COUNT(*) as total_memories,
                 SUM(content_size) as total_content_size,
-                COUNT(DISTINCT vector_id) as total_vectors,
                 COUNT(r2_key) as r2_stored_count,
                 (SELECT COUNT(*) FROM tags) as unique_tags,
                 (SELECT COUNT(*) FROM memories WHERE created_at >= {week_ago}) as memories_this_week
@@ -907,6 +1784,11 @@ class CloudflareStorage(MemoryStorage):
             response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
             result = response.json()
 
+            # PHASE 1: Get actual vector count from Vectorize API (not from D1)
+            vectorize_info = await self._get_vectorize_index_info()
+            actual_vector_count = vectorize_info.get("vectorCount", 0)
+            vectorize_dimensions = vectorize_info.get("dimensions", 768)
+
             if result.get("success") and result.get("result", [{}])[0].get("results"):
                 stats = result["result"][0]["results"][0]
 
@@ -915,7 +1797,8 @@ class CloudflareStorage(MemoryStorage):
                     "unique_tags": stats.get("unique_tags", 0),
                     "memories_this_week": stats.get("memories_this_week", 0),
                     "total_content_size_bytes": stats.get("total_content_size", 0),
-                    "total_vectors": stats.get("total_vectors", 0),
+                    "total_vectors": actual_vector_count,  # FIXED: From Vectorize API
+                    "vectorize_dimensions": vectorize_dimensions,
                     "r2_stored_count": stats.get("r2_stored_count", 0),
                     "storage_backend": "cloudflare",
                     "vectorize_index": self.vectorize_index,
@@ -928,6 +1811,7 @@ class CloudflareStorage(MemoryStorage):
                 "total_memories": 0,
                 "unique_tags": 0,
                 "memories_this_week": 0,
+                "total_vectors": actual_vector_count,
                 "storage_backend": "cloudflare",
                 "status": "operational"
             }
@@ -938,6 +1822,7 @@ class CloudflareStorage(MemoryStorage):
                 "total_memories": 0,
                 "unique_tags": 0,
                 "memories_this_week": 0,
+                "total_vectors": 0,
                 "storage_backend": "cloudflare",
                 "status": "error",
                 "error": str(e)
@@ -1431,6 +2316,505 @@ class CloudflareStorage(MemoryStorage):
         except Exception as e:
             logger.error(f"Error counting memories: {str(e)}")
             return 0
+
+    # ========== IMPROVEMENT #2: Find Stale Tasks ==========
+
+    async def find_stale_tasks(
+        self,
+        days: int = 7,
+        project: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Find tasks that are in-progress for too long.
+
+        Args:
+            days: Tasks older than this many days are considered stale
+            project: Optional project filter
+
+        Returns:
+            List of stale task memories
+        """
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+            sql = """
+            SELECT m.content_hash, m.content, m.memory_type, m.created_at_iso,
+                   GROUP_CONCAT(t.name, ',') as tags
+            FROM memories m
+            LEFT JOIN memory_tags mt ON m.id = mt.memory_id
+            LEFT JOIN tags t ON mt.tag_id = t.id
+            WHERE m.created_at_iso < ?
+            GROUP BY m.content_hash
+            HAVING tags LIKE '%status:in-progress%'
+            """
+
+            params = [cutoff]
+
+            if project:
+                sql = sql.replace(
+                    "HAVING tags LIKE '%status:in-progress%'",
+                    f"HAVING tags LIKE '%status:in-progress%' AND tags LIKE '%project:{project}%'"
+                )
+
+            sql += " ORDER BY m.created_at_iso ASC LIMIT 100"
+
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": sql, "params": params})
+            result = response.json()
+
+            if not result.get("success"):
+                raise ValueError(f"D1 query failed: {result}")
+
+            results = result.get("result", [{}])[0].get("results", [])
+            logger.info(f"Found {len(results)} stale tasks older than {days} days")
+            return results
+
+        except Exception as e:
+            logger.error(f"Error finding stale tasks: {e}")
+            return []
+
+    # ========== IMPROVEMENT #3: Load Project Context (PRIORITY) ==========
+
+    async def load_project_context(
+        self,
+        project: str,
+        include_tasks: bool = True,
+        include_recent: bool = True,
+        include_config: bool = True,
+        days: int = 14
+    ) -> Dict[str, Any]:
+        """Load full context for a project - perfect for starting a new session.
+
+        Args:
+            project: Project name (e.g., "freel", "mind-space")
+            include_tasks: Include pending and in-progress tasks
+            include_recent: Include recent sessions and decisions
+            include_config: Include project configuration/setup info
+            days: How many days back to look for recent items
+
+        Returns:
+            Dict with project context sections
+        """
+        context = {
+            "project": project,
+            "loaded_at": datetime.now(timezone.utc).isoformat(),
+            "pending_tasks": [],
+            "in_progress_tasks": [],
+            "recent_sessions": [],
+            "recent_decisions": [],
+            "recent_errors": [],
+            "config_and_setup": [],
+            "client_chats": [],
+            "summary": ""
+        }
+
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+            # Get tasks (pending and in-progress)
+            if include_tasks:
+                for status in ["pending", "in-progress"]:
+                    sql = """
+                    SELECT m.content_hash, m.content, m.memory_type, m.created_at_iso,
+                           GROUP_CONCAT(t.name, ',') as tags
+                    FROM memories m
+                    LEFT JOIN memory_tags mt ON m.id = mt.memory_id
+                    LEFT JOIN tags t ON mt.tag_id = t.id
+                    GROUP BY m.content_hash
+                    HAVING tags LIKE ? AND tags LIKE ?
+                    ORDER BY m.created_at_iso DESC
+                    LIMIT 20
+                    """
+                    response = await self._retry_request(
+                        "POST", f"{self.d1_url}/query",
+                        json={"sql": sql, "params": [f"%project:{project}%", f"%status:{status}%"]}
+                    )
+                    result = response.json()
+                    if result.get("success"):
+                        tasks = result.get("result", [{}])[0].get("results", [])
+                        if status == "pending":
+                            context["pending_tasks"] = tasks
+                        else:
+                            context["in_progress_tasks"] = tasks
+
+            # Get recent items by type
+            if include_recent:
+                for item_type, context_key in [
+                    ("session", "recent_sessions"),
+                    ("decision", "recent_decisions"),
+                    ("error", "recent_errors"),
+                    ("client-chat", "client_chats"),
+                ]:
+                    sql = """
+                    SELECT m.content_hash, m.content, m.memory_type, m.created_at_iso,
+                           GROUP_CONCAT(t.name, ',') as tags
+                    FROM memories m
+                    LEFT JOIN memory_tags mt ON m.id = mt.memory_id
+                    LEFT JOIN tags t ON mt.tag_id = t.id
+                    WHERE m.created_at_iso >= ?
+                    GROUP BY m.content_hash
+                    HAVING tags LIKE ? AND tags LIKE ?
+                    ORDER BY m.created_at_iso DESC
+                    LIMIT 10
+                    """
+                    response = await self._retry_request(
+                        "POST", f"{self.d1_url}/query",
+                        json={"sql": sql, "params": [cutoff, f"%project:{project}%", f"%type:{item_type}%"]}
+                    )
+                    result = response.json()
+                    if result.get("success"):
+                        context[context_key] = result.get("result", [{}])[0].get("results", [])
+
+            # Get config/setup info (no time limit)
+            if include_config:
+                sql = """
+                SELECT m.content_hash, m.content, m.memory_type, m.created_at_iso,
+                       GROUP_CONCAT(t.name, ',') as tags
+                FROM memories m
+                LEFT JOIN memory_tags mt ON m.id = mt.memory_id
+                LEFT JOIN tags t ON mt.tag_id = t.id
+                GROUP BY m.content_hash
+                HAVING tags LIKE ? AND (tags LIKE '%type:config%' OR tags LIKE '%type:setup%' OR tags LIKE '%type:architecture%')
+                ORDER BY m.created_at_iso DESC
+                LIMIT 10
+                """
+                response = await self._retry_request(
+                    "POST", f"{self.d1_url}/query",
+                    json={"sql": sql, "params": [f"%project:{project}%"]}
+                )
+                result = response.json()
+                if result.get("success"):
+                    context["config_and_setup"] = result.get("result", [{}])[0].get("results", [])
+
+            # Generate summary
+            total_pending = len(context["pending_tasks"])
+            total_in_progress = len(context["in_progress_tasks"])
+            total_errors = len(context["recent_errors"])
+
+            context["summary"] = (
+                f"Project: {project}\n"
+                f"Pending tasks: {total_pending}\n"
+                f"In-progress tasks: {total_in_progress}\n"
+                f"Recent errors: {total_errors}\n"
+                f"Recent sessions: {len(context['recent_sessions'])}\n"
+                f"Recent decisions: {len(context['recent_decisions'])}"
+            )
+
+            logger.info(f"Loaded context for project {project}: {total_pending} pending, {total_in_progress} in-progress")
+            return context
+
+        except Exception as e:
+            logger.error(f"Error loading project context: {e}")
+            context["error"] = str(e)
+            return context
+
+    # ========== IMPROVEMENT #5: Session State Helpers ==========
+
+    async def save_session_state(
+        self,
+        project: str,
+        current_task: str,
+        progress: str,
+        next_steps: List[str],
+        blockers: Optional[List[str]] = None
+    ) -> Tuple[bool, str]:
+        """Save current session state for continuity.
+
+        Call this before context overflow or session end.
+
+        Args:
+            project: Project name
+            current_task: What you're currently working on
+            progress: What's been done
+            next_steps: What needs to be done next
+            blockers: Any blockers or issues
+
+        Returns:
+            Tuple of (success, message/hash)
+        """
+        content = f"""SESSION STATE: {project}
+Saved: {datetime.now(timezone.utc).isoformat()}
+
+CURRENT TASK:
+{current_task}
+
+PROGRESS:
+{progress}
+
+NEXT STEPS:
+{chr(10).join(f'- {step}' for step in next_steps)}
+"""
+        if blockers:
+            content += f"\nBLOCKERS:\n{chr(10).join(f'- {b}' for b in blockers)}"
+
+        # Generate content hash
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+
+        memory = Memory(
+            content=content,
+            content_hash=content_hash,
+            memory_type="session",
+            tags=[f"project:{project}", "type:session", "session-state", "auto-save"]
+        )
+
+        return await self.store(memory)
+
+    async def get_interrupted_sessions(
+        self,
+        project: Optional[str] = None,
+        days: int = 7
+    ) -> List[Dict[str, Any]]:
+        """Find sessions that were saved but not marked as completed.
+
+        Use this at session start to resume interrupted work.
+
+        Args:
+            project: Optional project filter
+            days: Look back this many days
+
+        Returns:
+            List of interrupted session states
+        """
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+            sql = """
+            SELECT m.content_hash, m.content, m.memory_type, m.created_at_iso,
+                   GROUP_CONCAT(t.name, ',') as tags
+            FROM memories m
+            LEFT JOIN memory_tags mt ON m.id = mt.memory_id
+            LEFT JOIN tags t ON mt.tag_id = t.id
+            WHERE m.created_at_iso >= ?
+            GROUP BY m.content_hash
+            HAVING tags LIKE '%session-state%'
+            """
+
+            params = [cutoff]
+
+            if project:
+                sql = sql.replace(
+                    "HAVING tags LIKE '%session-state%'",
+                    f"HAVING tags LIKE '%session-state%' AND tags LIKE '%project:{project}%'"
+                )
+
+            sql += " ORDER BY m.created_at_iso DESC LIMIT 20"
+
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": sql, "params": params})
+            result = response.json()
+
+            if not result.get("success"):
+                raise ValueError(f"D1 query failed: {result}")
+
+            return result.get("result", [{}])[0].get("results", [])
+
+        except Exception as e:
+            logger.error(f"Error getting interrupted sessions: {e}")
+            return []
+
+    # ========== IMPROVEMENT #6: Memory Analytics ==========
+
+    async def get_memory_analytics(
+        self,
+        project: Optional[str] = None,
+        days: int = 30
+    ) -> Dict[str, Any]:
+        """Get analytics about memory usage.
+
+        Args:
+            project: Optional project filter
+            days: Analyze this many days
+
+        Returns:
+            Dict with analytics data
+        """
+        analytics = {
+            "period_days": days,
+            "project": project or "all",
+            "by_type": {},
+            "by_status": {},
+            "by_project": {},
+            "daily_counts": [],
+            "total_memories": 0,
+            "duplicate_estimate": 0
+        }
+
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+            # Total count
+            sql_total = "SELECT COUNT(*) as count FROM memories WHERE created_at_iso >= ?"
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": sql_total, "params": [cutoff]})
+            result = response.json()
+            if result.get("success"):
+                analytics["total_memories"] = result.get("result", [{}])[0].get("results", [{}])[0].get("count", 0)
+
+            # By type
+            sql_by_type = """
+            SELECT memory_type, COUNT(*) as count
+            FROM memories
+            WHERE created_at_iso >= ?
+            GROUP BY memory_type
+            ORDER BY count DESC
+            """
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": sql_by_type, "params": [cutoff]})
+            result = response.json()
+            if result.get("success"):
+                for row in result.get("result", [{}])[0].get("results", []):
+                    analytics["by_type"][row.get("memory_type") or "unknown"] = row.get("count", 0)
+
+            # By project (from tags)
+            sql_by_project = """
+            SELECT t.name, COUNT(DISTINCT m.id) as count
+            FROM memories m
+            JOIN memory_tags mt ON m.id = mt.memory_id
+            JOIN tags t ON mt.tag_id = t.id
+            WHERE t.name LIKE 'project:%' AND m.created_at_iso >= ?
+            GROUP BY t.name
+            ORDER BY count DESC
+            LIMIT 20
+            """
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": sql_by_project, "params": [cutoff]})
+            result = response.json()
+            if result.get("success"):
+                for row in result.get("result", [{}])[0].get("results", []):
+                    project_name = row.get("name", "").replace("project:", "")
+                    analytics["by_project"][project_name] = row.get("count", 0)
+
+            # By status (from tags)
+            sql_by_status = """
+            SELECT t.name, COUNT(DISTINCT m.id) as count
+            FROM memories m
+            JOIN memory_tags mt ON m.id = mt.memory_id
+            JOIN tags t ON mt.tag_id = t.id
+            WHERE t.name LIKE 'status:%' AND m.created_at_iso >= ?
+            GROUP BY t.name
+            ORDER BY count DESC
+            """
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": sql_by_status, "params": [cutoff]})
+            result = response.json()
+            if result.get("success"):
+                for row in result.get("result", [{}])[0].get("results", []):
+                    status_name = row.get("name", "").replace("status:", "")
+                    analytics["by_status"][status_name] = row.get("count", 0)
+
+            # Daily counts (last 7 days)
+            sql_daily = """
+            SELECT DATE(created_at_iso) as day, COUNT(*) as count
+            FROM memories
+            WHERE created_at_iso >= ?
+            GROUP BY DATE(created_at_iso)
+            ORDER BY day DESC
+            LIMIT 7
+            """
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": sql_daily, "params": [cutoff]})
+            result = response.json()
+            if result.get("success"):
+                analytics["daily_counts"] = result.get("result", [{}])[0].get("results", [])
+
+            logger.info(f"Generated analytics: {analytics['total_memories']} memories in {days} days")
+            return analytics
+
+        except Exception as e:
+            logger.error(f"Error generating analytics: {e}")
+            analytics["error"] = str(e)
+            return analytics
+
+    # ========== IMPROVEMENT #7: Safe Cleanup (dry-run by default) ==========
+
+    async def cleanup_old_memories(
+        self,
+        older_than_days: int = 90,
+        memory_types: Optional[List[str]] = None,
+        exclude_tags: Optional[List[str]] = None,
+        dry_run: bool = True
+    ) -> Dict[str, Any]:
+        """Clean up old memories safely.
+
+        IMPORTANT: dry_run=True by default to prevent accidental deletion.
+
+        Args:
+            older_than_days: Delete memories older than this
+            memory_types: Only these types (e.g., ["session", "test"])
+            exclude_tags: Never delete if has these tags (e.g., ["important", "keep"])
+            dry_run: If True, only report what would be deleted (default: True)
+
+        Returns:
+            Dict with cleanup results
+        """
+        result = {
+            "dry_run": dry_run,
+            "older_than_days": older_than_days,
+            "would_delete": 0,
+            "deleted": 0,
+            "preserved": 0,
+            "samples": []
+        }
+
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).strftime("%Y-%m-%d")
+
+            # Build query
+            sql = """
+            SELECT m.content_hash, m.content, m.memory_type, m.created_at_iso,
+                   GROUP_CONCAT(t.name, ',') as tags
+            FROM memories m
+            LEFT JOIN memory_tags mt ON m.id = mt.memory_id
+            LEFT JOIN tags t ON mt.tag_id = t.id
+            WHERE m.created_at_iso < ?
+            GROUP BY m.content_hash
+            """
+
+            params = [cutoff]
+
+            # Filter by memory types if specified
+            if memory_types:
+                placeholders = ",".join("?" * len(memory_types))
+                sql += f" HAVING m.memory_type IN ({placeholders})"
+                params.extend(memory_types)
+
+            sql += " ORDER BY m.created_at_iso ASC LIMIT 500"
+
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": sql, "params": params})
+            query_result = response.json()
+
+            if not query_result.get("success"):
+                raise ValueError(f"D1 query failed: {query_result}")
+
+            candidates = query_result.get("result", [{}])[0].get("results", [])
+
+            # Filter out excluded tags
+            exclude_tags = exclude_tags or ["important", "keep", "permanent", "config", "architecture"]
+            to_delete = []
+
+            for mem in candidates:
+                tags = mem.get("tags", "") or ""
+                should_preserve = any(excl in tags for excl in exclude_tags)
+
+                if should_preserve:
+                    result["preserved"] += 1
+                else:
+                    to_delete.append(mem)
+
+            result["would_delete"] = len(to_delete)
+            result["samples"] = [
+                {"hash": m["content_hash"][:16], "type": m.get("memory_type"), "date": m.get("created_at_iso", "")[:10]}
+                for m in to_delete[:10]
+            ]
+
+            # Actually delete if not dry run
+            if not dry_run and to_delete:
+                for mem in to_delete:
+                    try:
+                        await self.delete(mem["content_hash"])
+                        result["deleted"] += 1
+                    except Exception as e:
+                        logger.error(f"Failed to delete {mem['content_hash']}: {e}")
+
+            logger.info(f"Cleanup {'(dry-run)' if dry_run else ''}: {result['would_delete']} candidates, {result['deleted']} deleted, {result['preserved']} preserved")
+            return result
+
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            result["error"] = str(e)
+            return result
 
     async def close(self) -> None:
         """Close the storage backend and cleanup resources."""

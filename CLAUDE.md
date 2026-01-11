@@ -12,6 +12,13 @@ MCP Memory Service is a Model Context Protocol server providing semantic memory 
 
 > **🆕 v8.22.2**: **Complete Tag Parsing Fix** - Extended v8.22.1 character-split tags fix to all remaining locations (server.py MCP handlers, cli/ingestion.py). All tag parsing code paths now include type checking. 6 additional memories repaired. See [CHANGELOG.md](CHANGELOG.md) for full version history.
 >
+> **🚀 Memory Supercharge (Cloudflare Backend)**: New search tools in `cloudflare.py`:
+> - `hybrid_retrieve_memory` - Semantic + keyword search with RRF fusion
+> - `smart_retrieve_memory` - Auto-detects project/type/time from natural language queries
+> - `find_duplicate_memories` - Semantic duplicate detection
+> - `consolidate_memories` - Merge duplicate memories
+> - `cleanup_duplicates_auto` - Auto-cleanup old duplicates
+>
 > **Note**: When releasing new versions, update this line with current version + brief description. Use `.claude/agents/github-release-manager.md` agent for complete release workflow.
 
 ## Essential Commands
@@ -46,6 +53,52 @@ See [scripts/README.md](scripts/README.md) for complete command reference.
 
 **Key Patterns:**
 - Async/await for I/O, type safety (Python 3.10+), platform hardware optimization (CUDA/MPS/DirectML/ROCm)
+
+## Memory Supercharge (Cloudflare Backend)
+
+Enhanced search and deduplication for Cloudflare storage backend. Located in `src/mcp_memory_service/storage/cloudflare.py`.
+
+### New MCP Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `hybrid_retrieve_memory` | Semantic + keyword search combined with RRF | `query`, `n_results`, `semantic_weight`, `keyword_weight`, `project`, `memory_type` |
+| `smart_retrieve_memory` | Auto-detects filters from natural language | `query`, `n_results` |
+| `find_duplicate_memories` | Find semantically similar memories | `similarity_threshold`, `max_results`, `batch_size` |
+| `consolidate_memories` | Merge duplicate memories | `hashes[]`, `keep_hash`, `merge_tags` |
+| `cleanup_duplicates_auto` | Auto-cleanup old duplicates | `max_age_days`, `similarity_threshold`, `dry_run` |
+
+### Query Understanding (QueryParser)
+
+Located in `src/mcp_memory_service/utils/query_parser.py`. Regex-based, no AI required.
+
+**Auto-detected patterns:**
+- **Projects**: freel, mind-space, fixaro, mcp-memory (extensible)
+- **Types**: task, error, decision, session, config, deployment, documentation
+- **Status**: completed, in-progress, pending, blocked
+- **Time**: today, yesterday, last week, X days/weeks/months ago
+- **Abbreviations**: wp→wordpress, cf→cloudflare, js→javascript, db→database, ssh→ssh connection server
+
+**Example:**
+```python
+# Query: "freel wordpress error last week"
+# Parsed: project=freel, type=error, time=7 days, cleaned="wordpress"
+```
+
+### Hybrid Search (RRF)
+
+Combines Vectorize semantic search with D1 keyword search using Reciprocal Rank Fusion:
+```
+RRF_score = weight / (k + rank)
+```
+
+Default weights: semantic=0.6, keyword=0.4
+
+### Known Limitations
+
+- **Vectorize sync**: New memories may not be indexed immediately. Run migration script if search misses recent content.
+- **FTS5 unavailable**: Cloudflare D1 doesn't support FTS5, using LIKE fallback for keyword search.
+- **Tags filtering**: Requires memories to have proper `project:X` tags. Legacy memories without tags won't filter correctly.
 
 ## Document Ingestion
 
@@ -275,6 +328,45 @@ export CLOUDFLARE_VECTORIZE_INDEX="mcp-memory-index"
 
 #### **Memory Type Taxonomy**
 Use 24 core types: `note`, `reference`, `document`, `guide`, `session`, `implementation`, `analysis`, `troubleshooting`, `test`, `fix`, `feature`, `release`, `deployment`, `milestone`, `status`, `configuration`, `infrastructure`, `process`, `security`, `architecture`, `documentation`, `solution`, `achievement`. Avoid creating variations. See [scripts/maintenance/memory-types.md](scripts/maintenance/memory-types.md) for full taxonomy and consolidation guidelines.
+
+#### **Memory MCP Usage Rules (CRITICAL)**
+
+**1. ALWAYS structure with tags:**
+```
+project:[name]     - freel, mind-space, fixaro, mcp-memory
+type:[type]        - task, decision, error, session, config, client-chat, update, session-log
+status:[status]    - pending, in-progress, completed, blocked
+category:[cat]     - feature, bug-fix, deployment, config, architecture
+tech:[stack]       - typescript, react, wordpress, php, python
+```
+
+**2. Save MAXIMUM information:**
+- Cloudflare D1/Vectorize scales efficiently (O(log n) search)
+- 5,000 vs 500,000 memories = ~10ms difference
+- More context = better semantic search results
+- Never worry about database size
+
+**3. ❌ DO NOT use `cleanup_old_memories`:**
+- Cloudflare handles large databases efficiently
+- Old memories provide valuable historical context
+- Deletion is irreversible
+
+**4. ✅ DELETE ONLY when data contradicts:**
+- Old info that causes errors (e.g., wrong SSH port)
+- Duplicate content (>95% semantic similarity)
+- Factually incorrect information that misleads
+
+**5. Update procedure for contradicting data:**
+```python
+# 1. Find old record
+mcp__memory__retrieve_memory({query: "SSH port hostinger"})
+# 2. Delete incorrect
+mcp__memory__delete_memory({content_hash: "abc123..."})
+# 3. Store correct
+mcp__memory__store_memory({content: "SSH port: 65002", metadata: {...}})
+```
+
+**Goal:** Database should be ACCURATE and USEFUL, not just large.
 
 ### 🏗️ **Architecture & Testing**
 - Storage backends must implement abstract base class
