@@ -20,10 +20,24 @@ for retrieving memories based on when they were stored.
 """
 import re
 import logging
-from datetime import datetime, timedelta, date, time
+import os
+from datetime import datetime, timedelta, date, time, timezone
 from typing import Tuple, Optional, Dict, Any, List
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+# User timezone - Lviv (Europe/Kyiv)
+# Can be overridden with MCP_MEMORY_TIMEZONE env var
+USER_TIMEZONE = ZoneInfo(os.getenv("MCP_MEMORY_TIMEZONE", "Europe/Kyiv"))
+
+def _now() -> datetime:
+    """Get current datetime in user's timezone."""
+    return datetime.now(USER_TIMEZONE)
+
+def _today() -> date:
+    """Get today's date in user's timezone."""
+    return _now().date()
 
 # Named time periods and their approximate date ranges
 NAMED_PERIODS = {
@@ -112,7 +126,7 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
             month, day, year = specific_date_match.groups()
             month = int(month)
             day = int(day)
-            current_year = datetime.now().year
+            current_year = _now().year
             year = int(year) if year else current_year
             # Handle 2-digit years
             if year and year < 100:
@@ -137,7 +151,7 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
             else:
                 days = int(days_ago_match.group(1))
                 
-            target_date = date.today() - timedelta(days=days)
+            target_date = _today() - timedelta(days=days)
             
             # Check for time of day modifiers
             time_of_day_match = PATTERNS["time_of_day"].search(query)
@@ -154,7 +168,7 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
         weeks_ago_match = PATTERNS["relative_weeks"].search(query)
         if weeks_ago_match:
             weeks = int(weeks_ago_match.group(1))
-            target_date = date.today() - timedelta(weeks=weeks)
+            target_date = _today() - timedelta(weeks=weeks)
             # Get the start of the week (Monday)
             start_date = target_date - timedelta(days=target_date.weekday())
             end_date = start_date + timedelta(days=6)
@@ -166,7 +180,7 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
         months_ago_match = PATTERNS["relative_months"].search(query)
         if months_ago_match:
             months = int(months_ago_match.group(1))
-            current = datetime.now()
+            current = _now()
             # Calculate target month
             year = current.year
             month = current.month - months
@@ -191,7 +205,7 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
         years_ago_match = PATTERNS["relative_years"].search(query)
         if years_ago_match:
             years = int(years_ago_match.group(1))
-            current_year = datetime.now().year
+            current_year = _now().year
             target_year = current_year - years
             start_dt = datetime(target_year, 1, 1, 0, 0, 0)
             end_dt = datetime(target_year, 12, 31, 23, 59, 59)
@@ -226,7 +240,7 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
         if half_year_match:
             half = half_year_match.group(1)
             year_str = half_year_match.group(2)
-            year = int(year_str) if year_str else datetime.now().year
+            year = int(year_str) if year_str else _now().year
             
             if half.lower() == "first":
                 start_dt = datetime(year, 1, 1, 0, 0, 0)
@@ -242,7 +256,7 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
         if quarter_match:
             quarter = quarter_match.group(1).lower()
             year_str = quarter_match.group(2)
-            year = int(year_str) if year_str else datetime.now().year
+            year = int(year_str) if year_str else _now().year
             
             # Map textual quarter to number
             quarter_num = {"first": 1, "1st": 1, "second": 2, "2nd": 2, 
@@ -263,7 +277,7 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
         recent_match = PATTERNS["recent"].search(query)
         if recent_match:
             # Default to last 7 days for "recent"
-            end_dt = datetime.now()
+            end_dt = _now()
             start_dt = end_dt - timedelta(days=7)
             return start_dt.timestamp(), end_dt.timestamp()
             
@@ -306,8 +320,8 @@ def get_time_of_day_range(target_date: date, time_period: str) -> Tuple[float, f
 
 def get_last_period_range(period: str) -> Tuple[float, float]:
     """Get timestamp range for 'last X' expressions."""
-    now = datetime.now()
-    today = date.today()
+    now = _now()
+    today = _today()
     
     if period == "day":
         # Last day = yesterday
@@ -392,8 +406,8 @@ def get_last_period_range(period: str) -> Tuple[float, float]:
 
 def get_this_period_range(period: str) -> Tuple[float, float]:
     """Get timestamp range for 'this X' expressions."""
-    now = datetime.now()
-    today = date.today()
+    now = _now()
+    today = _today()
     
     if period == "day":
         # This day = today
@@ -457,10 +471,10 @@ def get_month_range(month_name: str) -> Tuple[float, float]:
     
     if month_name in month_map:
         month_num = month_map[month_name]
-        current_year = datetime.now().year
+        current_year = _now().year
         
         # If the month is in the future for this year, use last year
-        current_month = datetime.now().month
+        current_month = _now().month
         year = current_year if month_num <= current_month else current_year - 1
         
         # Get first and last day of the month
@@ -479,9 +493,9 @@ def get_month_range(month_name: str) -> Tuple[float, float]:
 def get_named_period_range(period_name: str) -> Tuple[Optional[float], Optional[float]]:
     """Get timestamp range for named periods like holidays."""
     period_name = period_name.lower().replace("_", " ")
-    current_year = datetime.now().year
-    current_month = datetime.now().month
-    current_day = datetime.now().day
+    current_year = _now().year
+    current_month = _now().month
+    current_day = _now().day
     
     if period_name in NAMED_PERIODS:
         info = NAMED_PERIODS[period_name]
