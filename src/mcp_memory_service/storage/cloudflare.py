@@ -100,6 +100,11 @@ class CloudflareStorage(MemoryStorage):
         self._embedding_cache = {}
         self._cache_max_size = 1000
 
+        # Auto-linking configuration (v9.0)
+        self.auto_link_enabled = True  # Enable auto-linking for new memories
+        self.auto_link_threshold = 0.80  # Minimum similarity to create edge
+        self.auto_link_max_edges = 3  # Max edges per new memory
+
     # ========== Structured Metadata Helpers ==========
 
     def _extract_tag_value(self, tags_str: str, prefix: str) -> Optional[str]:
@@ -197,14 +202,19 @@ class CloudflareStorage(MemoryStorage):
     
     async def _generate_embedding(self, text: str) -> List[float]:
         """Generate embedding using Workers AI or cache."""
-        # Check cache first
-        text_hash = hashlib.sha256(text.encode()).hexdigest()
+        # Truncate text to fit model's context window
+        # all-MiniLM-L6-v2 has ~512 token limit (~1500 chars safely)
+        MAX_EMBEDDING_CHARS = 1500
+        truncated_text = text[:MAX_EMBEDDING_CHARS] if len(text) > MAX_EMBEDDING_CHARS else text
+
+        # Check cache first (use truncated text for cache key)
+        text_hash = hashlib.sha256(truncated_text.encode()).hexdigest()
         if text_hash in self._embedding_cache:
             return self._embedding_cache[text_hash]
-        
+
         try:
             # Use Workers AI to generate embedding
-            payload = {"text": [text]}
+            payload = {"text": [truncated_text]}
             response = await self._retry_request("POST", self.ai_url, json=payload)
             result = response.json()
             
@@ -268,7 +278,11 @@ class CloudflareStorage(MemoryStorage):
             metadata_json TEXT,
             vector_id TEXT UNIQUE,
             content_size INTEGER DEFAULT 0,
-            r2_key TEXT
+            r2_key TEXT,
+            -- Decay/Reinforcement fields (v9.0)
+            strength REAL DEFAULT 1.0,
+            access_count INTEGER DEFAULT 0,
+            last_accessed TEXT
         );
         
         -- Tags table
@@ -291,6 +305,42 @@ class CloudflareStorage(MemoryStorage):
         CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
         CREATE INDEX IF NOT EXISTS idx_memories_vector_id ON memories(vector_id);
         CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name);
+
+        -- === GRAPH RELATIONS (v9.0) ===
+        -- Memory edges table for graph relations between memories
+        CREATE TABLE IF NOT EXISTS memory_edges (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            source_hash TEXT NOT NULL,
+            target_hash TEXT NOT NULL,
+            edge_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            metadata_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(source_hash, target_hash, edge_type),
+            FOREIGN KEY (source_hash) REFERENCES memories(content_hash) ON DELETE CASCADE,
+            FOREIGN KEY (target_hash) REFERENCES memories(content_hash) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_hash);
+        CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_hash);
+        CREATE INDEX IF NOT EXISTS idx_edges_type ON memory_edges(edge_type);
+
+        -- === SAFE ARCHIVE (v9.0) ===
+        -- Archive table for soft-deleted memories (consolidation safety net)
+        CREATE TABLE IF NOT EXISTS memory_archive (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            original_content_hash TEXT NOT NULL,
+            content TEXT NOT NULL,
+            memory_type TEXT,
+            metadata_json TEXT,
+            tags_json TEXT,
+            archived_at TEXT DEFAULT (datetime('now')),
+            archived_reason TEXT,
+            consolidated_into TEXT,
+            restored BOOLEAN DEFAULT FALSE,
+            restored_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_archive_hash ON memory_archive(original_content_hash);
+        CREATE INDEX IF NOT EXISTS idx_archive_consolidated ON memory_archive(consolidated_into);
         """
         
         payload = {"sql": schema_sql}
@@ -393,17 +443,83 @@ class CloudflareStorage(MemoryStorage):
             }
 
             await self._store_vectorize_vector(vector_id, embedding, vector_metadata)
-            
+
             # Store metadata in D1
             await self._store_d1_memory(memory, vector_id, content_size, r2_key, stored_content)
-            
+
             logger.info(f"Successfully stored memory: {memory.content_hash}")
+
+            # Auto-link to similar memories if enabled
+            if getattr(self, 'auto_link_enabled', True):
+                await self._auto_link_memory(memory.content_hash, memory.content)
+
             return True, f"Memory stored successfully (vector_id: {vector_id})"
-            
+
         except Exception as e:
             logger.error(f"Failed to store memory {memory.content_hash}: {e}")
             return False, f"Storage failed: {str(e)}"
-    
+
+    async def _auto_link_memory(self, content_hash: str, content: str) -> None:
+        """
+        Automatically create edges to similar memories after storing.
+
+        This runs asynchronously after a memory is stored and creates
+        'related_to' edges to semantically similar memories.
+        Non-blocking: errors are logged but don't affect the store operation.
+        """
+        try:
+            # Skip short content
+            if len(content) < 50:
+                return
+
+            # Find similar memories
+            similar_results = await self.search(
+                query=content,
+                n_results=self.auto_link_max_edges + 1
+            )
+
+            edges_created = 0
+            for result in similar_results:
+                # Skip self
+                if result.memory.content_hash == content_hash:
+                    continue
+
+                # Check threshold
+                if result.relevance_score < self.auto_link_threshold:
+                    continue
+
+                # Limit edges
+                if edges_created >= self.auto_link_max_edges:
+                    break
+
+                # Check if edge already exists
+                if await self.edge_exists(content_hash, result.memory.content_hash):
+                    continue
+
+                # Create edge
+                success, _ = await self.link_memories(
+                    source_hash=content_hash,
+                    target_hash=result.memory.content_hash,
+                    edge_type="related_to",
+                    weight=result.relevance_score,
+                    metadata={
+                        "auto_generated": True,
+                        "on_store": True,
+                        "similarity": result.relevance_score
+                    }
+                )
+
+                if success:
+                    edges_created += 1
+                    logger.debug(f"Auto-linked {content_hash[:8]} -> {result.memory.content_hash[:8]} (sim={result.relevance_score:.2f})")
+
+            if edges_created > 0:
+                logger.info(f"Auto-linked memory {content_hash[:8]} to {edges_created} similar memories")
+
+        except Exception as e:
+            # Log but don't fail - auto-linking is non-critical
+            logger.warning(f"Auto-link failed for {content_hash[:8]}: {e}")
+
     async def _store_vectorize_vector(self, vector_id: str, embedding: List[float], metadata: Dict[str, Any]) -> None:
         """Store vector in Vectorize."""
         # Try without namespace first to isolate the issue
@@ -1509,6 +1625,1081 @@ class CloudflareStorage(MemoryStorage):
         except Exception as e:
             logger.error(f"Error counting memories: {str(e)}")
             return 0
+
+    # =========================================================================
+    # GRAPH RELATIONS (v9.0) - Memory edges for relationships between memories
+    # =========================================================================
+
+    async def _ensure_graph_schema(self) -> None:
+        """Ensure graph-related tables exist (migration for existing DBs)."""
+        migration_sql = """
+        -- Add decay fields to memories if not exist (safe ALTER - SQLite ignores if exists)
+        ALTER TABLE memories ADD COLUMN strength REAL DEFAULT 1.0;
+        ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0;
+        ALTER TABLE memories ADD COLUMN last_accessed TEXT;
+        """
+        # SQLite doesn't have IF NOT EXISTS for ALTER, so we try and ignore errors
+        try:
+            payload = {"sql": migration_sql}
+            await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+        except Exception:
+            pass  # Columns may already exist
+
+    async def link_memories(
+        self,
+        source_hash: str,
+        target_hash: str,
+        edge_type: str,
+        weight: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, str]:
+        """
+        Create a directed edge between two memories.
+
+        Args:
+            source_hash: Content hash of source memory
+            target_hash: Content hash of target memory
+            edge_type: Type of relationship (depends_on, blocks, related_to, parent_of, references, derived_from)
+            weight: Strength of relationship (0.0 to 1.0)
+            metadata: Optional JSON metadata for the edge
+
+        Returns:
+            Tuple of (success, message or edge_id)
+        """
+        try:
+            import uuid
+            edge_id = str(uuid.uuid4())
+            metadata_json = json.dumps(metadata) if metadata else None
+
+            sql = """
+            INSERT INTO memory_edges (id, source_hash, target_hash, edge_type, weight, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_hash, target_hash, edge_type) DO UPDATE SET
+                weight = excluded.weight,
+                metadata_json = excluded.metadata_json
+            """
+
+            payload = {"sql": sql, "params": [edge_id, source_hash, target_hash, edge_type, weight, metadata_json]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if not result.get("success"):
+                return False, f"Failed to create edge: {result}"
+
+            logger.info(f"Created edge: {source_hash[:8]} --{edge_type}--> {target_hash[:8]}")
+            return True, edge_id
+
+        except Exception as e:
+            logger.error(f"Error creating edge: {str(e)}")
+            return False, str(e)
+
+    async def unlink_memories(
+        self,
+        source_hash: str,
+        target_hash: str,
+        edge_type: Optional[str] = None
+    ) -> Tuple[bool, int]:
+        """
+        Remove edge(s) between two memories.
+
+        Args:
+            source_hash: Content hash of source memory
+            target_hash: Content hash of target memory
+            edge_type: Specific edge type to remove (None = all edges between these memories)
+
+        Returns:
+            Tuple of (success, count of removed edges)
+        """
+        try:
+            if edge_type:
+                sql = "DELETE FROM memory_edges WHERE source_hash = ? AND target_hash = ? AND edge_type = ?"
+                params = [source_hash, target_hash, edge_type]
+            else:
+                sql = "DELETE FROM memory_edges WHERE source_hash = ? AND target_hash = ?"
+                params = [source_hash, target_hash]
+
+            payload = {"sql": sql, "params": params}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if not result.get("success"):
+                return False, 0
+
+            # D1 doesn't return affected rows easily, assume success
+            logger.info(f"Removed edges between {source_hash[:8]} and {target_hash[:8]}")
+            return True, 1
+
+        except Exception as e:
+            logger.error(f"Error removing edge: {str(e)}")
+            return False, 0
+
+    async def get_related(
+        self,
+        content_hash: str,
+        edge_type: Optional[str] = None,
+        direction: str = "both",
+        depth: int = 1
+    ) -> List[Dict[str, Any]]:
+        """
+        Get memories related to the given memory through edges.
+
+        Args:
+            content_hash: Content hash of the memory to find relations for
+            edge_type: Filter by edge type (None = all types)
+            direction: 'outgoing', 'incoming', or 'both'
+            depth: How many levels to traverse (default 1, max 5)
+
+        Returns:
+            List of related memories with edge information
+        """
+        try:
+            depth = min(depth, 5)  # Cap depth for performance
+            results = []
+            visited = set([content_hash])
+
+            # Current level hashes to explore
+            current_level = [content_hash]
+
+            for level in range(depth):
+                next_level = []
+
+                for hash_to_explore in current_level:
+                    # Build query based on direction
+                    if direction == "outgoing":
+                        sql = "SELECT * FROM memory_edges WHERE source_hash = ?"
+                    elif direction == "incoming":
+                        sql = "SELECT * FROM memory_edges WHERE target_hash = ?"
+                    else:  # both
+                        sql = "SELECT * FROM memory_edges WHERE source_hash = ? OR target_hash = ?"
+
+                    params = [hash_to_explore]
+                    if direction == "both":
+                        params.append(hash_to_explore)
+
+                    if edge_type:
+                        sql += " AND edge_type = ?"
+                        params.append(edge_type)
+
+                    payload = {"sql": sql, "params": params}
+                    response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+                    result = response.json()
+
+                    if result.get("success") and result.get("result", [{}])[0].get("results"):
+                        for edge in result["result"][0]["results"]:
+                            # Determine the related hash (the one that's not hash_to_explore)
+                            related_hash = edge["target_hash"] if edge["source_hash"] == hash_to_explore else edge["source_hash"]
+
+                            if related_hash not in visited:
+                                visited.add(related_hash)
+                                next_level.append(related_hash)
+
+                                # Fetch the actual memory
+                                memory = await self.get_by_hash(related_hash)
+                                if memory:
+                                    results.append({
+                                        "memory": memory.to_dict(),
+                                        "edge": {
+                                            "id": edge["id"],
+                                            "type": edge["edge_type"],
+                                            "weight": edge["weight"],
+                                            "direction": "outgoing" if edge["source_hash"] == content_hash else "incoming",
+                                            "depth": level + 1
+                                        }
+                                    })
+
+                current_level = next_level
+                if not current_level:
+                    break
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Error getting related memories: {str(e)}")
+            return []
+
+    async def get_memory_graph(
+        self,
+        project: Optional[str] = None,
+        include_completed: bool = True,
+        max_nodes: int = 100
+    ) -> Dict[str, Any]:
+        """
+        Get a full graph view of memories for visualization.
+
+        Args:
+            project: Filter by project tag
+            include_completed: Include completed tasks
+            max_nodes: Maximum number of nodes to return
+
+        Returns:
+            Dict with 'nodes' and 'edges' for graph visualization
+        """
+        try:
+            # Get memories (nodes)
+            if project:
+                memories = await self.search_by_tag([f"project:{project}"])
+            else:
+                memories = await self.get_recent_memories(max_nodes)
+
+            if not include_completed:
+                memories = [m for m in memories if "status:completed" not in (m.metadata.tags or [])]
+
+            memories = memories[:max_nodes]
+
+            # Get content hashes of our nodes
+            node_hashes = {m.content_hash for m in memories}
+
+            # Get all edges between these nodes
+            placeholders = ",".join(["?" for _ in node_hashes])
+            sql = f"""
+            SELECT * FROM memory_edges
+            WHERE source_hash IN ({placeholders}) AND target_hash IN ({placeholders})
+            """
+            params = list(node_hashes) + list(node_hashes)
+
+            payload = {"sql": sql, "params": params}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            edges = []
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                edges = result["result"][0]["results"]
+
+            return {
+                "nodes": [
+                    {
+                        "id": m.content_hash,
+                        "content": m.content[:100] + "..." if len(m.content) > 100 else m.content,
+                        "type": m.metadata.memory_type,
+                        "tags": m.metadata.tags
+                    }
+                    for m in memories
+                ],
+                "edges": [
+                    {
+                        "source": e["source_hash"],
+                        "target": e["target_hash"],
+                        "type": e["edge_type"],
+                        "weight": e["weight"]
+                    }
+                    for e in edges
+                ],
+                "stats": {
+                    "node_count": len(memories),
+                    "edge_count": len(edges)
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting memory graph: {str(e)}")
+            return {"nodes": [], "edges": [], "stats": {"node_count": 0, "edge_count": 0}}
+
+    async def find_path(
+        self,
+        from_hash: str,
+        to_hash: str,
+        max_depth: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Find the shortest path between two memories through edges.
+
+        Args:
+            from_hash: Starting memory content hash
+            to_hash: Target memory content hash
+            max_depth: Maximum path length to search
+
+        Returns:
+            List of memories forming the path (empty if no path found)
+        """
+        try:
+            from collections import deque
+
+            # BFS to find shortest path
+            queue = deque([(from_hash, [from_hash])])
+            visited = {from_hash}
+
+            while queue:
+                current_hash, path = queue.popleft()
+
+                if len(path) > max_depth:
+                    continue
+
+                # Get all connected memories
+                sql = """
+                SELECT target_hash as related FROM memory_edges WHERE source_hash = ?
+                UNION
+                SELECT source_hash as related FROM memory_edges WHERE target_hash = ?
+                """
+                params = [current_hash, current_hash]
+
+                payload = {"sql": sql, "params": params}
+                response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+                result = response.json()
+
+                if result.get("success") and result.get("result", [{}])[0].get("results"):
+                    for row in result["result"][0]["results"]:
+                        related = row["related"]
+
+                        if related == to_hash:
+                            # Found the target!
+                            full_path = path + [related]
+                            # Fetch all memories in path
+                            path_memories = []
+                            for hash_val in full_path:
+                                memory = await self.get_by_hash(hash_val)
+                                if memory:
+                                    path_memories.append(memory.to_dict())
+                            return path_memories
+
+                        if related not in visited:
+                            visited.add(related)
+                            queue.append((related, path + [related]))
+
+            return []  # No path found
+
+        except Exception as e:
+            logger.error(f"Error finding path: {str(e)}")
+            return []
+
+    # =========================================================================
+    # DECAY/REINFORCEMENT (v9.0) - Track memory importance over time
+    # =========================================================================
+
+    async def reinforce_memory(self, content_hash: str) -> bool:
+        """
+        Reinforce a memory by incrementing access count and updating last_accessed.
+        Called automatically when a memory is retrieved.
+
+        Args:
+            content_hash: Content hash of the memory to reinforce
+
+        Returns:
+            True if reinforcement was successful
+        """
+        try:
+            from datetime import datetime
+            now = datetime.utcnow().isoformat()
+
+            sql = """
+            UPDATE memories
+            SET access_count = COALESCE(access_count, 0) + 1,
+                last_accessed = ?,
+                strength = CASE
+                    WHEN strength IS NULL THEN 1.0
+                    WHEN strength < 2.0 THEN strength + 0.1
+                    ELSE strength
+                END
+            WHERE content_hash = ?
+            """
+
+            payload = {"sql": sql, "params": [now, content_hash]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            return result.get("success", False)
+
+        except Exception as e:
+            logger.error(f"Error reinforcing memory: {str(e)}")
+            return False
+
+    async def get_weak_memories(
+        self,
+        threshold: float = 0.5,
+        min_age_days: int = 30,
+        limit: int = 50
+    ) -> List[Memory]:
+        """
+        Get memories with low strength score for review (NOT auto-deletion).
+        This is INFORMATIONAL only - user decides what to do with results.
+
+        Args:
+            threshold: Maximum strength to include (default 0.5)
+            min_age_days: Only include memories older than this (default 30)
+            limit: Maximum results to return
+
+        Returns:
+            List of weak memories for user review
+        """
+        try:
+            from datetime import datetime, timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=min_age_days)).timestamp()
+
+            sql = """
+            SELECT * FROM memories
+            WHERE (strength IS NULL OR strength < ?)
+            AND created_at < ?
+            ORDER BY strength ASC, access_count ASC
+            LIMIT ?
+            """
+
+            payload = {"sql": sql, "params": [threshold, cutoff, limit]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            memories = []
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                for row in result["result"][0]["results"]:
+                    memory = await self._load_memory_from_row(row)
+                    if memory:
+                        memories.append(memory)
+
+            return memories
+
+        except Exception as e:
+            logger.error(f"Error getting weak memories: {str(e)}")
+            return []
+
+    # =========================================================================
+    # PROACTIVE RETRIEVAL (v9.0) - Auto-load relevant context
+    # =========================================================================
+
+    async def get_session_context(
+        self,
+        project: Optional[str] = None,
+        recent_count: int = 10,
+        important_tags: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Get comprehensive session context for project start.
+        Combines multiple queries into one efficient call.
+
+        Args:
+            project: Project name to filter by
+            recent_count: Number of recent items to include
+            important_tags: Tags to include as important
+
+        Returns:
+            Dict with categorized memories for session context
+        """
+        try:
+            if important_tags is None:
+                important_tags = ["important", "pinned"]
+
+            context = {
+                "in_progress_tasks": [],
+                "recent_memories": [],
+                "important": [],
+                "blockers": [],
+                "recent_errors": [],
+                "recent_decisions": []
+            }
+
+            # In-progress tasks
+            in_progress = await self.search_by_tag(["status:in-progress"])
+            if project:
+                in_progress = [m for m in in_progress if f"project:{project}" in (m.metadata.tags or [])]
+            context["in_progress_tasks"] = [m.to_dict() for m in in_progress[:10]]
+
+            # Important memories
+            important = await self.search_by_tag(important_tags)
+            if project:
+                important = [m for m in important if f"project:{project}" in (m.metadata.tags or [])]
+            context["important"] = [m.to_dict() for m in important[:10]]
+
+            # Recent memories for project
+            if project:
+                recent = await self.search_by_tag([f"project:{project}"])
+                context["recent_memories"] = [m.to_dict() for m in recent[:recent_count]]
+            else:
+                recent = await self.get_recent_memories(recent_count)
+                context["recent_memories"] = [m.to_dict() for m in recent]
+
+            # Blockers
+            blockers = await self.search_by_tag(["status:blocked"])
+            if project:
+                blockers = [m for m in blockers if f"project:{project}" in (m.metadata.tags or [])]
+            context["blockers"] = [m.to_dict() for m in blockers[:5]]
+
+            # Recent errors
+            errors = await self.search_by_tag(["type:error"])
+            if project:
+                errors = [m for m in errors if f"project:{project}" in (m.metadata.tags or [])]
+            context["recent_errors"] = [m.to_dict() for m in errors[:5]]
+
+            # Recent decisions
+            decisions = await self.search_by_tag(["type:decision"])
+            if project:
+                decisions = [m for m in decisions if f"project:{project}" in (m.metadata.tags or [])]
+            context["recent_decisions"] = [m.to_dict() for m in decisions[:5]]
+
+            return context
+
+        except Exception as e:
+            logger.error(f"Error getting session context: {str(e)}")
+            return {
+                "in_progress_tasks": [],
+                "recent_memories": [],
+                "important": [],
+                "blockers": [],
+                "recent_errors": [],
+                "recent_decisions": []
+            }
+
+    async def get_project_summary(self, project: str) -> Dict[str, Any]:
+        """
+        Get summary statistics for a project.
+
+        Args:
+            project: Project name
+
+        Returns:
+            Dict with project summary statistics
+        """
+        try:
+            all_memories = await self.search_by_tag([f"project:{project}"])
+
+            # Count by status
+            status_counts = {}
+            type_counts = {}
+
+            for m in all_memories:
+                tags = m.metadata.tags or []
+
+                # Count statuses
+                for tag in tags:
+                    if tag.startswith("status:"):
+                        status = tag.split(":")[1]
+                        status_counts[status] = status_counts.get(status, 0) + 1
+
+                # Count types
+                mem_type = m.metadata.memory_type or "unknown"
+                type_counts[mem_type] = type_counts.get(mem_type, 0) + 1
+
+            return {
+                "project": project,
+                "total_memories": len(all_memories),
+                "by_status": status_counts,
+                "by_type": type_counts,
+                "last_activity": all_memories[0].metadata.created_at_iso if all_memories else None
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting project summary: {str(e)}")
+            return {"project": project, "error": str(e)}
+
+    # =========================================================================
+    # SAFE CONSOLIDATION (v9.0) - Merge duplicates with archive safety net
+    # =========================================================================
+
+    async def find_duplicate_memories(
+        self,
+        similarity_threshold: float = 0.95,
+        max_results: int = 50,
+        batch_size: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Find semantically similar memories that might be duplicates.
+        READ-ONLY: Does not modify or delete anything.
+
+        Args:
+            similarity_threshold: Minimum similarity to consider duplicate (default 0.95)
+            max_results: Maximum duplicate pairs to return
+            batch_size: Batch size for processing
+
+        Returns:
+            List of duplicate pairs with similarity scores
+        """
+        try:
+            duplicates = []
+
+            # Get recent memories to check
+            memories = await self.get_recent_memories(batch_size * 2)
+
+            for i, mem1 in enumerate(memories):
+                if len(duplicates) >= max_results:
+                    break
+
+                for mem2 in memories[i+1:]:
+                    if len(duplicates) >= max_results:
+                        break
+
+                    # Simple content-based similarity check first
+                    if abs(len(mem1.content) - len(mem2.content)) > len(mem1.content) * 0.2:
+                        continue  # Content length too different
+
+                    # Check semantic similarity
+                    try:
+                        emb1 = await self._generate_embedding(mem1.content)
+                        emb2 = await self._generate_embedding(mem2.content)
+
+                        # Cosine similarity
+                        dot = sum(a * b for a, b in zip(emb1, emb2))
+                        norm1 = sum(a * a for a in emb1) ** 0.5
+                        norm2 = sum(b * b for b in emb2) ** 0.5
+                        similarity = dot / (norm1 * norm2) if norm1 * norm2 > 0 else 0
+
+                        if similarity >= similarity_threshold:
+                            duplicates.append({
+                                "memory1": {
+                                    "hash": mem1.content_hash,
+                                    "content_preview": mem1.content[:100],
+                                    "created": mem1.metadata.created_at_iso,
+                                    "tags": mem1.metadata.tags
+                                },
+                                "memory2": {
+                                    "hash": mem2.content_hash,
+                                    "content_preview": mem2.content[:100],
+                                    "created": mem2.metadata.created_at_iso,
+                                    "tags": mem2.metadata.tags
+                                },
+                                "similarity": round(similarity, 4)
+                            })
+                    except Exception:
+                        continue
+
+            return duplicates
+
+        except Exception as e:
+            logger.error(f"Error finding duplicates: {str(e)}")
+            return []
+
+    async def preview_consolidation(
+        self,
+        memory_hashes: List[str],
+        merge_strategy: str = "newest"
+    ) -> Dict[str, Any]:
+        """
+        Preview what consolidation would do WITHOUT executing it.
+        DRY-RUN only - no data is modified.
+
+        Args:
+            memory_hashes: List of content hashes to consider for merging
+            merge_strategy: 'newest', 'oldest', 'combine_tags'
+
+        Returns:
+            Preview of what would happen
+        """
+        try:
+            memories = []
+            for hash_val in memory_hashes:
+                mem = await self.get_by_hash(hash_val)
+                if mem:
+                    memories.append(mem)
+
+            if len(memories) < 2:
+                return {"error": "Need at least 2 memories to consolidate"}
+
+            # Sort by creation date
+            memories.sort(key=lambda m: m.metadata.created_at or 0)
+
+            if merge_strategy == "newest":
+                keep = memories[-1]
+                archive = memories[:-1]
+            elif merge_strategy == "oldest":
+                keep = memories[0]
+                archive = memories[1:]
+            else:  # combine_tags
+                keep = memories[-1]
+                archive = memories[:-1]
+
+            # Combine tags
+            all_tags = set()
+            for m in memories:
+                all_tags.update(m.metadata.tags or [])
+
+            return {
+                "strategy": merge_strategy,
+                "keep": {
+                    "hash": keep.content_hash,
+                    "content_preview": keep.content[:200],
+                    "original_tags": keep.metadata.tags,
+                    "merged_tags": list(all_tags)
+                },
+                "archive": [
+                    {
+                        "hash": m.content_hash,
+                        "content_preview": m.content[:100],
+                        "tags": m.metadata.tags
+                    }
+                    for m in archive
+                ],
+                "total_memories_affected": len(memories),
+                "NOTE": "This is a PREVIEW. No data has been modified. Call consolidate_memories with dry_run=False to execute."
+            }
+
+        except Exception as e:
+            logger.error(f"Error previewing consolidation: {str(e)}")
+            return {"error": str(e)}
+
+    async def consolidate_memories(
+        self,
+        memory_hashes: List[str],
+        keep_hash: str,
+        merge_tags: bool = True,
+        dry_run: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Consolidate multiple memories into one, archiving the rest.
+
+        SAFETY: dry_run=True by default. Archives (not deletes) memories.
+
+        Args:
+            memory_hashes: List of content hashes to consolidate
+            keep_hash: Content hash of the memory to keep
+            merge_tags: Whether to merge tags from archived memories
+            dry_run: If True, only preview without executing
+
+        Returns:
+            Result of consolidation (or preview if dry_run)
+        """
+        try:
+            if keep_hash not in memory_hashes:
+                return {"error": "keep_hash must be in memory_hashes"}
+
+            if dry_run:
+                return await self.preview_consolidation(memory_hashes, "newest")
+
+            # Fetch all memories
+            memories = {}
+            for hash_val in memory_hashes:
+                mem = await self.get_by_hash(hash_val)
+                if mem:
+                    memories[hash_val] = mem
+
+            if keep_hash not in memories:
+                return {"error": f"Memory {keep_hash} not found"}
+
+            keep_memory = memories[keep_hash]
+            archive_hashes = [h for h in memory_hashes if h != keep_hash]
+
+            # Collect tags to merge
+            merged_tags = set(keep_memory.metadata.tags or [])
+            if merge_tags:
+                for h in archive_hashes:
+                    if h in memories:
+                        merged_tags.update(memories[h].metadata.tags or [])
+
+            # Archive memories (soft-delete)
+            archived_count = 0
+            for h in archive_hashes:
+                if h in memories:
+                    mem = memories[h]
+
+                    # Insert into archive
+                    import uuid
+                    archive_id = str(uuid.uuid4())
+
+                    archive_sql = """
+                    INSERT INTO memory_archive (id, original_content_hash, content, memory_type,
+                        metadata_json, tags_json, archived_reason, consolidated_into)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """
+
+                    archive_params = [
+                        archive_id,
+                        mem.content_hash,
+                        mem.content,
+                        mem.metadata.memory_type,
+                        json.dumps(mem.metadata.to_dict()) if hasattr(mem.metadata, 'to_dict') else None,
+                        json.dumps(list(mem.metadata.tags or [])),
+                        "consolidated",
+                        keep_hash
+                    ]
+
+                    payload = {"sql": archive_sql, "params": archive_params}
+                    response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+                    result = response.json()
+
+                    if result.get("success"):
+                        # Delete from main table
+                        await self.delete(h)
+
+                        # Create "consolidated_from" edge for history
+                        await self.link_memories(
+                            keep_hash, h, "consolidated_from",
+                            metadata={"archived_at": datetime.utcnow().isoformat()}
+                        )
+
+                        archived_count += 1
+
+            # Update kept memory with merged tags
+            if merge_tags and merged_tags:
+                await self.update_memory_metadata(keep_hash, {"tags": list(merged_tags)})
+
+            return {
+                "success": True,
+                "kept": keep_hash,
+                "archived": archived_count,
+                "merged_tags": list(merged_tags),
+                "message": f"Consolidated {archived_count + 1} memories. Archived memories can be restored."
+            }
+
+        except Exception as e:
+            logger.error(f"Error consolidating memories: {str(e)}")
+            return {"error": str(e)}
+
+    async def restore_archived(self, archive_id: str) -> Tuple[bool, str]:
+        """
+        Restore an archived memory back to active storage.
+
+        Args:
+            archive_id: ID of the archived memory
+
+        Returns:
+            Tuple of (success, restored_content_hash or error message)
+        """
+        try:
+            # Get archived memory
+            sql = "SELECT * FROM memory_archive WHERE id = ? AND restored = FALSE"
+            payload = {"sql": sql, "params": [archive_id]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if not result.get("success") or not result.get("result", [{}])[0].get("results"):
+                return False, "Archived memory not found or already restored"
+
+            row = result["result"][0]["results"][0]
+
+            # Recreate memory
+            tags = json.loads(row["tags_json"]) if row.get("tags_json") else []
+            memory = Memory(
+                content=row["content"],
+                tags=tags,
+                memory_type=row.get("memory_type")
+            )
+
+            # Store it
+            success, message = await self.store(memory)
+
+            if success:
+                # Mark as restored in archive
+                update_sql = "UPDATE memory_archive SET restored = TRUE, restored_at = ? WHERE id = ?"
+                from datetime import datetime
+                payload = {"sql": update_sql, "params": [datetime.utcnow().isoformat(), archive_id]}
+                await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+
+                return True, memory.content_hash
+
+            return False, message
+
+        except Exception as e:
+            logger.error(f"Error restoring archived memory: {str(e)}")
+            return False, str(e)
+
+    async def list_archived(
+        self,
+        consolidated_into: Optional[str] = None,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        List archived memories for review.
+
+        Args:
+            consolidated_into: Filter by the memory they were consolidated into
+            limit: Maximum results
+
+        Returns:
+            List of archived memory info
+        """
+        try:
+            if consolidated_into:
+                sql = """
+                SELECT id, original_content_hash, content, memory_type, archived_at,
+                    archived_reason, consolidated_into, restored
+                FROM memory_archive
+                WHERE consolidated_into = ? AND restored = FALSE
+                ORDER BY archived_at DESC
+                LIMIT ?
+                """
+                params = [consolidated_into, limit]
+            else:
+                sql = """
+                SELECT id, original_content_hash, content, memory_type, archived_at,
+                    archived_reason, consolidated_into, restored
+                FROM memory_archive
+                WHERE restored = FALSE
+                ORDER BY archived_at DESC
+                LIMIT ?
+                """
+                params = [limit]
+
+            payload = {"sql": sql, "params": params}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                return [
+                    {
+                        "archive_id": row["id"],
+                        "original_hash": row["original_content_hash"],
+                        "content_preview": row["content"][:100] if row.get("content") else "",
+                        "type": row.get("memory_type"),
+                        "archived_at": row.get("archived_at"),
+                        "reason": row.get("archived_reason"),
+                        "consolidated_into": row.get("consolidated_into")
+                    }
+                    for row in result["result"][0]["results"]
+                ]
+
+            return []
+
+        except Exception as e:
+            logger.error(f"Error listing archived memories: {str(e)}")
+            return []
+
+    # =========================================================================
+    # AUTO-GRAPH BUILDING (v9.0) - Build relationships for existing memories
+    # =========================================================================
+
+    async def edge_exists(
+        self,
+        source_hash: str,
+        target_hash: str,
+        edge_type: Optional[str] = None
+    ) -> bool:
+        """
+        Check if an edge exists between two memories (in either direction).
+
+        Args:
+            source_hash: Content hash of first memory
+            target_hash: Content hash of second memory
+            edge_type: Specific edge type to check (None = any edge)
+
+        Returns:
+            True if edge exists
+        """
+        try:
+            if edge_type:
+                sql = """
+                SELECT 1 FROM memory_edges
+                WHERE ((source_hash = ?1 AND target_hash = ?2)
+                    OR (source_hash = ?2 AND target_hash = ?1))
+                  AND edge_type = ?3
+                LIMIT 1
+                """
+                params = [source_hash, target_hash, edge_type]
+            else:
+                sql = """
+                SELECT 1 FROM memory_edges
+                WHERE (source_hash = ?1 AND target_hash = ?2)
+                   OR (source_hash = ?2 AND target_hash = ?1)
+                LIMIT 1
+                """
+                params = [source_hash, target_hash]
+
+            payload = {"sql": sql, "params": params}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if result.get("success") and result.get("result", [{}])[0].get("results"):
+                return len(result["result"][0]["results"]) > 0
+            return False
+
+        except Exception as e:
+            logger.error(f"Error checking edge existence: {str(e)}")
+            return False
+
+    async def build_auto_graph(
+        self,
+        threshold: float = 0.75,
+        max_memories: int = 1000,
+        max_edges_per_memory: int = 5,
+        dry_run: bool = True,
+        progress_callback: Optional[callable] = None
+    ) -> Dict[str, Any]:
+        """
+        Build graph relationships for existing memories based on semantic similarity.
+
+        This method analyzes memories and creates 'related_to' edges between
+        semantically similar ones. Safe operation - only adds edges, never removes.
+
+        Args:
+            threshold: Minimum similarity score (0.0-1.0) to create edge
+            max_memories: Maximum memories to process
+            max_edges_per_memory: Maximum edges to create per memory
+            dry_run: If True, only preview without creating edges
+            progress_callback: Optional callback(processed, total, edges_created)
+
+        Returns:
+            Dict with stats: processed, edges_created, edges_skipped, errors
+        """
+        logger.info(f"Building auto-graph: threshold={threshold}, max={max_memories}, dry_run={dry_run}")
+
+        stats = {
+            "processed": 0,
+            "edges_created": 0,
+            "edges_skipped": 0,
+            "errors": 0,
+            "dry_run": dry_run
+        }
+
+        try:
+            # Get memories to process
+            memories = await self.get_all_memories(limit=max_memories)
+            total = len(memories)
+
+            if not memories:
+                logger.info("No memories to process for auto-graph")
+                return stats
+
+            for memory in memories:
+                stats["processed"] += 1
+
+                # Skip short content
+                if not memory.content or len(memory.content) < 20:
+                    continue
+
+                try:
+                    # Find similar memories
+                    similar_results = await self.search(
+                        query=memory.content,
+                        n_results=max_edges_per_memory + 1
+                    )
+
+                    edges_for_memory = 0
+                    for result in similar_results:
+                        # Skip self
+                        if result.memory.content_hash == memory.content_hash:
+                            continue
+
+                        # Check threshold
+                        if result.relevance_score < threshold:
+                            continue
+
+                        # Limit edges per memory
+                        if edges_for_memory >= max_edges_per_memory:
+                            break
+
+                        # Check if edge exists
+                        if await self.edge_exists(memory.content_hash, result.memory.content_hash):
+                            stats["edges_skipped"] += 1
+                            continue
+
+                        # Create edge (or just count for dry run)
+                        if not dry_run:
+                            success, _ = await self.link_memories(
+                                source_hash=memory.content_hash,
+                                target_hash=result.memory.content_hash,
+                                edge_type="related_to",
+                                weight=result.relevance_score,
+                                metadata={
+                                    "auto_generated": True,
+                                    "similarity": result.relevance_score,
+                                    "build_version": "v9.0"
+                                }
+                            )
+                            if not success:
+                                stats["errors"] += 1
+                                continue
+
+                        stats["edges_created"] += 1
+                        edges_for_memory += 1
+
+                except Exception as e:
+                    logger.warning(f"Error processing memory {memory.content_hash[:8]}: {e}")
+                    stats["errors"] += 1
+
+                # Progress callback
+                if progress_callback and stats["processed"] % 50 == 0:
+                    progress_callback(stats["processed"], total, stats["edges_created"])
+
+            logger.info(f"Auto-graph complete: {stats}")
+            return stats
+
+        except Exception as e:
+            logger.error(f"Error in build_auto_graph: {str(e)}")
+            stats["errors"] += 1
+            return stats
 
     async def close(self) -> None:
         """Close the storage backend and cleanup resources."""

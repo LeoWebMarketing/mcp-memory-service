@@ -1755,7 +1755,422 @@ class MemoryServer:
                         }
                     )
                 ]
-                
+
+                # === GRAPH RELATIONS TOOLS (v9.0) ===
+                graph_tools = [
+                    types.Tool(
+                        name="link_memories",
+                        description="""Create a directed relationship (edge) between two memories.
+
+                        Edge types: depends_on, blocks, related_to, parent_of, references, derived_from, consolidated_from
+
+                        Example:
+                        {
+                            "source_hash": "abc123...",
+                            "target_hash": "def456...",
+                            "edge_type": "depends_on",
+                            "weight": 1.0
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "source_hash": {
+                                    "type": "string",
+                                    "description": "Content hash of the source memory"
+                                },
+                                "target_hash": {
+                                    "type": "string",
+                                    "description": "Content hash of the target memory"
+                                },
+                                "edge_type": {
+                                    "type": "string",
+                                    "enum": ["depends_on", "blocks", "related_to", "parent_of", "references", "derived_from", "consolidated_from"],
+                                    "description": "Type of relationship"
+                                },
+                                "weight": {
+                                    "type": "number",
+                                    "default": 1.0,
+                                    "description": "Strength of relationship (0.0 to 1.0)"
+                                },
+                                "metadata": {
+                                    "type": "object",
+                                    "description": "Optional JSON metadata for the edge"
+                                }
+                            },
+                            "required": ["source_hash", "target_hash", "edge_type"]
+                        }
+                    ),
+                    types.Tool(
+                        name="unlink_memories",
+                        description="""Remove edge(s) between two memories.
+
+                        Example:
+                        {
+                            "source_hash": "abc123...",
+                            "target_hash": "def456...",
+                            "edge_type": "depends_on"
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "source_hash": {
+                                    "type": "string",
+                                    "description": "Content hash of the source memory"
+                                },
+                                "target_hash": {
+                                    "type": "string",
+                                    "description": "Content hash of the target memory"
+                                },
+                                "edge_type": {
+                                    "type": "string",
+                                    "description": "Specific edge type to remove (omit to remove all edges)"
+                                }
+                            },
+                            "required": ["source_hash", "target_hash"]
+                        }
+                    ),
+                    types.Tool(
+                        name="get_related",
+                        description="""Get memories related to a given memory through edges.
+
+                        Example:
+                        {
+                            "content_hash": "abc123...",
+                            "edge_type": "depends_on",
+                            "direction": "outgoing",
+                            "depth": 2
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "content_hash": {
+                                    "type": "string",
+                                    "description": "Content hash of the memory to find relations for"
+                                },
+                                "edge_type": {
+                                    "type": "string",
+                                    "description": "Filter by edge type (omit for all types)"
+                                },
+                                "direction": {
+                                    "type": "string",
+                                    "enum": ["outgoing", "incoming", "both"],
+                                    "default": "both",
+                                    "description": "Direction of edges to follow"
+                                },
+                                "depth": {
+                                    "type": "number",
+                                    "default": 1,
+                                    "description": "How many levels to traverse (1-5)"
+                                }
+                            },
+                            "required": ["content_hash"]
+                        }
+                    ),
+                    types.Tool(
+                        name="get_memory_graph",
+                        description="""Get a full graph view of memories for visualization.
+
+                        Example:
+                        {
+                            "project": "mind-space",
+                            "include_completed": false,
+                            "max_nodes": 50
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "project": {
+                                    "type": "string",
+                                    "description": "Filter by project tag"
+                                },
+                                "include_completed": {
+                                    "type": "boolean",
+                                    "default": True,
+                                    "description": "Include completed tasks"
+                                },
+                                "max_nodes": {
+                                    "type": "number",
+                                    "default": 100,
+                                    "description": "Maximum nodes to return"
+                                }
+                            }
+                        }
+                    ),
+                    types.Tool(
+                        name="find_path",
+                        description="""Find the shortest path between two memories through edges.
+
+                        Example:
+                        {
+                            "from_hash": "abc123...",
+                            "to_hash": "def456...",
+                            "max_depth": 5
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "from_hash": {
+                                    "type": "string",
+                                    "description": "Starting memory content hash"
+                                },
+                                "to_hash": {
+                                    "type": "string",
+                                    "description": "Target memory content hash"
+                                },
+                                "max_depth": {
+                                    "type": "number",
+                                    "default": 5,
+                                    "description": "Maximum path length"
+                                }
+                            },
+                            "required": ["from_hash", "to_hash"]
+                        }
+                    )
+                ]
+                tools.extend(graph_tools)
+                logger.info(f"Added {len(graph_tools)} graph relation tools")
+
+                # === DECAY/REINFORCEMENT TOOLS (v9.0) ===
+                decay_tools = [
+                    types.Tool(
+                        name="get_weak_memories",
+                        description="""Get memories with low strength score for review.
+                        READ-ONLY: Does not delete anything. User decides what to do.
+
+                        Example:
+                        {
+                            "threshold": 0.5,
+                            "min_age_days": 30,
+                            "limit": 20
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "threshold": {
+                                    "type": "number",
+                                    "default": 0.5,
+                                    "description": "Maximum strength to include"
+                                },
+                                "min_age_days": {
+                                    "type": "number",
+                                    "default": 30,
+                                    "description": "Only include memories older than this"
+                                },
+                                "limit": {
+                                    "type": "number",
+                                    "default": 50,
+                                    "description": "Maximum results"
+                                }
+                            }
+                        }
+                    )
+                ]
+                tools.extend(decay_tools)
+                logger.info(f"Added {len(decay_tools)} decay tools")
+
+                # === PROACTIVE RETRIEVAL TOOLS (v9.0) ===
+                proactive_tools = [
+                    types.Tool(
+                        name="get_session_context",
+                        description="""Get comprehensive session context for project start.
+                        Combines in-progress tasks, important memories, blockers, errors, decisions.
+
+                        Example:
+                        {
+                            "project": "mind-space",
+                            "recent_count": 10
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "project": {
+                                    "type": "string",
+                                    "description": "Project name to filter by"
+                                },
+                                "recent_count": {
+                                    "type": "number",
+                                    "default": 10,
+                                    "description": "Number of recent items"
+                                },
+                                "important_tags": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Tags to include as important",
+                                    "default": ["important", "pinned"]
+                                }
+                            }
+                        }
+                    ),
+                    types.Tool(
+                        name="get_project_summary",
+                        description="""Get summary statistics for a project.
+
+                        Example:
+                        {
+                            "project": "mind-space"
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "project": {
+                                    "type": "string",
+                                    "description": "Project name"
+                                }
+                            },
+                            "required": ["project"]
+                        }
+                    )
+                ]
+                tools.extend(proactive_tools)
+                logger.info(f"Added {len(proactive_tools)} proactive retrieval tools")
+
+                # === SAFE CONSOLIDATION TOOLS (v9.0) ===
+                safe_consolidation_tools = [
+                    types.Tool(
+                        name="find_duplicate_memories",
+                        description="""Find semantically similar memories that might be duplicates.
+                        READ-ONLY: Does not modify or delete anything.
+
+                        Example:
+                        {
+                            "similarity_threshold": 0.95,
+                            "max_results": 20
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "similarity_threshold": {
+                                    "type": "number",
+                                    "default": 0.95,
+                                    "description": "Minimum similarity (0.0-1.0)"
+                                },
+                                "max_results": {
+                                    "type": "number",
+                                    "default": 50,
+                                    "description": "Maximum pairs to return"
+                                },
+                                "batch_size": {
+                                    "type": "number",
+                                    "default": 100,
+                                    "description": "Batch size for processing"
+                                }
+                            }
+                        }
+                    ),
+                    types.Tool(
+                        name="preview_consolidation",
+                        description="""Preview what consolidation would do WITHOUT executing it.
+                        DRY-RUN only - no data is modified.
+
+                        Example:
+                        {
+                            "memory_hashes": ["abc...", "def...", "ghi..."],
+                            "merge_strategy": "newest"
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "memory_hashes": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Content hashes to consider for merging"
+                                },
+                                "merge_strategy": {
+                                    "type": "string",
+                                    "enum": ["newest", "oldest", "combine_tags"],
+                                    "default": "newest",
+                                    "description": "Which memory to keep"
+                                }
+                            },
+                            "required": ["memory_hashes"]
+                        }
+                    ),
+                    types.Tool(
+                        name="safe_consolidate_memories",
+                        description="""Consolidate multiple memories into one, ARCHIVING the rest.
+                        SAFETY: dry_run=True by default. Archives (not deletes) memories.
+                        Archived memories can be restored with restore_archived.
+
+                        Example:
+                        {
+                            "memory_hashes": ["abc...", "def..."],
+                            "keep_hash": "abc...",
+                            "merge_tags": true,
+                            "dry_run": true
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "memory_hashes": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Content hashes to consolidate"
+                                },
+                                "keep_hash": {
+                                    "type": "string",
+                                    "description": "Hash of memory to keep"
+                                },
+                                "merge_tags": {
+                                    "type": "boolean",
+                                    "default": True,
+                                    "description": "Merge tags from archived memories"
+                                },
+                                "dry_run": {
+                                    "type": "boolean",
+                                    "default": True,
+                                    "description": "If true, only preview (SAFE default)"
+                                }
+                            },
+                            "required": ["memory_hashes", "keep_hash"]
+                        }
+                    ),
+                    types.Tool(
+                        name="restore_archived",
+                        description="""Restore an archived memory back to active storage.
+
+                        Example:
+                        {
+                            "archive_id": "uuid-of-archived-memory"
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "archive_id": {
+                                    "type": "string",
+                                    "description": "ID of archived memory"
+                                }
+                            },
+                            "required": ["archive_id"]
+                        }
+                    ),
+                    types.Tool(
+                        name="list_archived",
+                        description="""List archived memories for review.
+
+                        Example:
+                        {
+                            "consolidated_into": "abc...",
+                            "limit": 20
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "consolidated_into": {
+                                    "type": "string",
+                                    "description": "Filter by memory they were consolidated into"
+                                },
+                                "limit": {
+                                    "type": "number",
+                                    "default": 50,
+                                    "description": "Maximum results"
+                                }
+                            }
+                        }
+                    )
+                ]
+                tools.extend(safe_consolidation_tools)
+                logger.info(f"Added {len(safe_consolidation_tools)} safe consolidation tools")
+
                 # Add consolidation tools if enabled
                 if CONSOLIDATION_ENABLED and self.consolidator:
                     consolidation_tools = [
@@ -2080,6 +2495,49 @@ class MemoryServer:
                 elif name == "ingest_directory":
                     logger.info("Calling handle_ingest_directory")
                     return await self.handle_ingest_directory(arguments)
+                # Graph relation tools (v9.0)
+                elif name == "link_memories":
+                    logger.info("Calling handle_link_memories")
+                    return await self.handle_link_memories(arguments)
+                elif name == "unlink_memories":
+                    logger.info("Calling handle_unlink_memories")
+                    return await self.handle_unlink_memories(arguments)
+                elif name == "get_related":
+                    logger.info("Calling handle_get_related")
+                    return await self.handle_get_related(arguments)
+                elif name == "get_memory_graph":
+                    logger.info("Calling handle_get_memory_graph")
+                    return await self.handle_get_memory_graph(arguments)
+                elif name == "find_path":
+                    logger.info("Calling handle_find_path")
+                    return await self.handle_find_path(arguments)
+                # Decay/Reinforcement tools (v9.0)
+                elif name == "get_weak_memories":
+                    logger.info("Calling handle_get_weak_memories")
+                    return await self.handle_get_weak_memories(arguments)
+                # Proactive retrieval tools (v9.0)
+                elif name == "get_session_context":
+                    logger.info("Calling handle_get_session_context")
+                    return await self.handle_get_session_context(arguments)
+                elif name == "get_project_summary":
+                    logger.info("Calling handle_get_project_summary")
+                    return await self.handle_get_project_summary(arguments)
+                # Safe consolidation tools (v9.0)
+                elif name == "find_duplicate_memories":
+                    logger.info("Calling handle_find_duplicate_memories_safe")
+                    return await self.handle_find_duplicate_memories_safe(arguments)
+                elif name == "preview_consolidation":
+                    logger.info("Calling handle_preview_consolidation")
+                    return await self.handle_preview_consolidation(arguments)
+                elif name == "safe_consolidate_memories":
+                    logger.info("Calling handle_safe_consolidate_memories")
+                    return await self.handle_safe_consolidate_memories(arguments)
+                elif name == "restore_archived":
+                    logger.info("Calling handle_restore_archived")
+                    return await self.handle_restore_archived(arguments)
+                elif name == "list_archived":
+                    logger.info("Calling handle_list_archived")
+                    return await self.handle_list_archived(arguments)
                 else:
                     logger.warning(f"Unknown tool requested: {name}")
                     raise ValueError(f"Unknown tool: {name}")
@@ -2263,7 +2721,7 @@ class MemoryServer:
 
     async def handle_delete_memory(self, arguments: dict) -> List[types.TextContent]:
         content_hash = arguments.get("content_hash")
-        
+
         try:
             # Initialize storage lazily when needed (also initializes memory_service)
             await self._ensure_storage_initialized()
@@ -2271,7 +2729,12 @@ class MemoryServer:
             # Call shared MemoryService business logic
             result = await self.memory_service.delete_memory(content_hash)
 
-            return [types.TextContent(type="text", text=result["message"])]
+            # Handle result format from memory_service (success/error, not message)
+            if result.get("success"):
+                return [types.TextContent(type="text", text=f"Memory deleted successfully: {content_hash}")]
+            else:
+                error = result.get("error", "Unknown error")
+                return [types.TextContent(type="text", text=f"Failed to delete memory: {error}")]
         except Exception as e:
             logger.error(f"Error deleting memory: {str(e)}\n{traceback.format_exc()}")
             return [types.TextContent(type="text", text=f"Error deleting memory: {str(e)}")]
@@ -3565,6 +4028,565 @@ Memories Archived: {report.memories_archived}"""
                 type="text",
                 text=f"Error ingesting directory: {str(e)}"
             )]
+
+    # ============================================
+    # GRAPH RELATION HANDLERS (v9.0)
+    # ============================================
+
+    async def handle_link_memories(self, arguments: dict) -> List[types.TextContent]:
+        """Create a relationship between two memories."""
+        source_hash = arguments.get("source_hash")
+        target_hash = arguments.get("target_hash")
+        edge_type = arguments.get("edge_type", "related_to")
+        weight = arguments.get("weight", 1.0)
+        metadata = arguments.get("metadata")
+
+        if not source_hash or not target_hash:
+            return [types.TextContent(type="text", text="Error: source_hash and target_hash are required")]
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'link_memories'):
+                return [types.TextContent(type="text", text="Error: Graph relations not supported by this storage backend")]
+
+            result = await storage.link_memories(source_hash, target_hash, edge_type, weight, metadata)
+
+            if result.get("success"):
+                return [types.TextContent(
+                    type="text",
+                    text=f"✅ Link created: {source_hash[:8]}... --[{edge_type}]--> {target_hash[:8]}..."
+                )]
+            else:
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+        except Exception as e:
+            logger.error(f"Error linking memories: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error linking memories: {str(e)}")]
+
+    async def handle_unlink_memories(self, arguments: dict) -> List[types.TextContent]:
+        """Remove a relationship between two memories."""
+        source_hash = arguments.get("source_hash")
+        target_hash = arguments.get("target_hash")
+        edge_type = arguments.get("edge_type")
+
+        if not source_hash or not target_hash:
+            return [types.TextContent(type="text", text="Error: source_hash and target_hash are required")]
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'unlink_memories'):
+                return [types.TextContent(type="text", text="Error: Graph relations not supported by this storage backend")]
+
+            result = await storage.unlink_memories(source_hash, target_hash, edge_type)
+
+            if result.get("success"):
+                edge_info = f" [{edge_type}]" if edge_type else ""
+                return [types.TextContent(
+                    type="text",
+                    text=f"✅ Link removed{edge_info}: {source_hash[:8]}... <--> {target_hash[:8]}..."
+                )]
+            else:
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+        except Exception as e:
+            logger.error(f"Error unlinking memories: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error unlinking memories: {str(e)}")]
+
+    async def handle_get_related(self, arguments: dict) -> List[types.TextContent]:
+        """Get memories related to a specific memory."""
+        content_hash = arguments.get("content_hash")
+        edge_type = arguments.get("edge_type")
+        direction = arguments.get("direction", "both")
+        max_depth = arguments.get("max_depth", 1)
+
+        if not content_hash:
+            return [types.TextContent(type="text", text="Error: content_hash is required")]
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'get_related'):
+                return [types.TextContent(type="text", text="Error: Graph relations not supported by this storage backend")]
+
+            result = await storage.get_related(content_hash, edge_type, direction, max_depth)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            related = result.get("related", [])
+            if not related:
+                return [types.TextContent(type="text", text=f"No related memories found for {content_hash[:8]}...")]
+
+            # Format results
+            lines = [f"📊 Found {len(related)} related memories for {content_hash[:8]}...:"]
+            for item in related:
+                edge_type_str = item.get("edge_type", "related")
+                direction_str = item.get("direction", "")
+                depth = item.get("depth", 1)
+                memory = item.get("memory", {})
+                content_preview = memory.get("content", "")[:100] + "..." if len(memory.get("content", "")) > 100 else memory.get("content", "")
+
+                lines.append(f"\n  [{edge_type_str}] (depth={depth}, dir={direction_str})")
+                lines.append(f"    Hash: {memory.get('content_hash', 'unknown')[:12]}...")
+                lines.append(f"    Content: {content_preview}")
+                if memory.get("tags"):
+                    lines.append(f"    Tags: {', '.join(memory['tags'][:5])}")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error getting related memories: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error getting related memories: {str(e)}")]
+
+    async def handle_get_memory_graph(self, arguments: dict) -> List[types.TextContent]:
+        """Get the entire memory graph or a subgraph."""
+        center_hash = arguments.get("center_hash")
+        max_depth = arguments.get("max_depth", 2)
+        edge_types = arguments.get("edge_types")
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'get_memory_graph'):
+                return [types.TextContent(type="text", text="Error: Graph relations not supported by this storage backend")]
+
+            result = await storage.get_memory_graph(center_hash, max_depth, edge_types)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            nodes = result.get("nodes", [])
+            edges = result.get("edges", [])
+
+            lines = [f"🕸️ Memory Graph: {len(nodes)} nodes, {len(edges)} edges"]
+
+            if center_hash:
+                lines.append(f"   Centered on: {center_hash[:12]}...")
+
+            lines.append(f"\n📍 Nodes:")
+            for node in nodes[:20]:  # Limit display
+                content_preview = node.get("content", "")[:60] + "..." if len(node.get("content", "")) > 60 else node.get("content", "")
+                lines.append(f"   • {node.get('content_hash', 'unknown')[:12]}... : {content_preview}")
+
+            if len(nodes) > 20:
+                lines.append(f"   ... and {len(nodes) - 20} more nodes")
+
+            lines.append(f"\n🔗 Edges:")
+            for edge in edges[:20]:  # Limit display
+                lines.append(f"   {edge.get('source', 'unknown')[:8]}... --[{edge.get('edge_type', 'related')}]--> {edge.get('target', 'unknown')[:8]}...")
+
+            if len(edges) > 20:
+                lines.append(f"   ... and {len(edges) - 20} more edges")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error getting memory graph: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error getting memory graph: {str(e)}")]
+
+    async def handle_find_path(self, arguments: dict) -> List[types.TextContent]:
+        """Find the shortest path between two memories."""
+        source_hash = arguments.get("source_hash")
+        target_hash = arguments.get("target_hash")
+        max_depth = arguments.get("max_depth", 5)
+
+        if not source_hash or not target_hash:
+            return [types.TextContent(type="text", text="Error: source_hash and target_hash are required")]
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'find_path'):
+                return [types.TextContent(type="text", text="Error: Graph relations not supported by this storage backend")]
+
+            result = await storage.find_path(source_hash, target_hash, max_depth)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            path = result.get("path", [])
+            if not path:
+                return [types.TextContent(type="text", text=f"No path found between {source_hash[:8]}... and {target_hash[:8]}... (max_depth={max_depth})")]
+
+            lines = [f"🛤️ Path found ({len(path)} hops):"]
+            for i, step in enumerate(path):
+                if i == 0:
+                    lines.append(f"   START: {step.get('hash', 'unknown')[:12]}...")
+                elif i == len(path) - 1:
+                    lines.append(f"   --[{step.get('edge_type', 'related')}]-->")
+                    lines.append(f"   END: {step.get('hash', 'unknown')[:12]}...")
+                else:
+                    lines.append(f"   --[{step.get('edge_type', 'related')}]-->")
+                    lines.append(f"   {step.get('hash', 'unknown')[:12]}...")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error finding path: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error finding path: {str(e)}")]
+
+    # ============================================
+    # DECAY/REINFORCEMENT HANDLERS (v9.0)
+    # ============================================
+
+    async def handle_get_weak_memories(self, arguments: dict) -> List[types.TextContent]:
+        """Get memories with low strength scores (candidates for review)."""
+        threshold = arguments.get("threshold", 0.3)
+        limit = arguments.get("limit", 20)
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'get_weak_memories'):
+                return [types.TextContent(type="text", text="Error: Decay scoring not supported by this storage backend")]
+
+            result = await storage.get_weak_memories(threshold, limit)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            memories = result.get("memories", [])
+            if not memories:
+                return [types.TextContent(type="text", text=f"No weak memories found (threshold < {threshold})")]
+
+            lines = [f"⚠️ Found {len(memories)} weak memories (strength < {threshold}):"]
+            for mem in memories:
+                strength = mem.get("strength", 0)
+                access_count = mem.get("access_count", 0)
+                last_accessed = mem.get("last_accessed", "never")
+                content_preview = mem.get("content", "")[:80] + "..." if len(mem.get("content", "")) > 80 else mem.get("content", "")
+
+                lines.append(f"\n  📉 Strength: {strength:.2f} | Accesses: {access_count} | Last: {last_accessed}")
+                lines.append(f"     Hash: {mem.get('content_hash', 'unknown')[:12]}...")
+                lines.append(f"     Content: {content_preview}")
+
+            lines.append(f"\n💡 These memories are informational only. Use reinforce_memory or review manually.")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error getting weak memories: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error getting weak memories: {str(e)}")]
+
+    # ============================================
+    # PROACTIVE RETRIEVAL HANDLERS (v9.0)
+    # ============================================
+
+    async def handle_get_session_context(self, arguments: dict) -> List[types.TextContent]:
+        """Get relevant context for a new session based on recent activity and project."""
+        project = arguments.get("project")
+        include_in_progress = arguments.get("include_in_progress", True)
+        include_recent = arguments.get("include_recent", True)
+        include_important = arguments.get("include_important", True)
+        max_results = arguments.get("max_results", 10)
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'get_session_context'):
+                return [types.TextContent(type="text", text="Error: Proactive retrieval not supported by this storage backend")]
+
+            result = await storage.get_session_context(
+                project=project,
+                include_in_progress=include_in_progress,
+                include_recent=include_recent,
+                include_important=include_important,
+                max_results=max_results
+            )
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            context = result.get("context", {})
+
+            lines = ["🚀 Session Context Loaded:"]
+
+            # In-progress tasks
+            in_progress = context.get("in_progress", [])
+            if in_progress:
+                lines.append(f"\n📋 In-Progress Tasks ({len(in_progress)}):")
+                for task in in_progress[:5]:
+                    content_preview = task.get("content", "")[:100]
+                    lines.append(f"   • {content_preview}")
+
+            # Recent memories
+            recent = context.get("recent", [])
+            if recent:
+                lines.append(f"\n🕐 Recent Activity ({len(recent)}):")
+                for mem in recent[:5]:
+                    content_preview = mem.get("content", "")[:80]
+                    lines.append(f"   • {content_preview}")
+
+            # Important memories
+            important = context.get("important", [])
+            if important:
+                lines.append(f"\n⭐ Important ({len(important)}):")
+                for mem in important[:5]:
+                    content_preview = mem.get("content", "")[:80]
+                    lines.append(f"   • {content_preview}")
+
+            if not in_progress and not recent and not important:
+                lines.append("\n   No relevant context found for this session.")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error getting session context: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error getting session context: {str(e)}")]
+
+    async def handle_get_project_summary(self, arguments: dict) -> List[types.TextContent]:
+        """Get a summary of a project's state including tasks, decisions, and blockers."""
+        project = arguments.get("project")
+
+        if not project:
+            return [types.TextContent(type="text", text="Error: project name is required")]
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'get_project_summary'):
+                return [types.TextContent(type="text", text="Error: Project summary not supported by this storage backend")]
+
+            result = await storage.get_project_summary(project)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            summary = result.get("summary", {})
+
+            lines = [f"📊 Project Summary: {project}"]
+
+            stats = summary.get("stats", {})
+            lines.append(f"\n📈 Stats:")
+            lines.append(f"   Total memories: {stats.get('total', 0)}")
+            lines.append(f"   Tasks: {stats.get('tasks', 0)}")
+            lines.append(f"   Decisions: {stats.get('decisions', 0)}")
+            lines.append(f"   Errors: {stats.get('errors', 0)}")
+
+            status_breakdown = summary.get("status_breakdown", {})
+            if status_breakdown:
+                lines.append(f"\n📋 Task Status:")
+                for status, count in status_breakdown.items():
+                    emoji = {"completed": "✅", "in-progress": "🔄", "pending": "⏳", "blocked": "🚫"}.get(status, "•")
+                    lines.append(f"   {emoji} {status}: {count}")
+
+            recent_decisions = summary.get("recent_decisions", [])
+            if recent_decisions:
+                lines.append(f"\n💡 Recent Decisions:")
+                for dec in recent_decisions[:3]:
+                    lines.append(f"   • {dec.get('content', '')[:80]}")
+
+            blockers = summary.get("blockers", [])
+            if blockers:
+                lines.append(f"\n🚫 Current Blockers:")
+                for blocker in blockers[:3]:
+                    lines.append(f"   • {blocker.get('content', '')[:80]}")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error getting project summary: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error getting project summary: {str(e)}")]
+
+    # ============================================
+    # SAFE CONSOLIDATION HANDLERS (v9.0)
+    # ============================================
+
+    async def handle_find_duplicate_memories_safe(self, arguments: dict) -> List[types.TextContent]:
+        """Find semantically similar (potentially duplicate) memories."""
+        similarity_threshold = arguments.get("similarity_threshold", 0.9)
+        limit = arguments.get("limit", 50)
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'find_duplicate_memories'):
+                return [types.TextContent(type="text", text="Error: Duplicate detection not supported by this storage backend")]
+
+            result = await storage.find_duplicate_memories(similarity_threshold, limit)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            duplicates = result.get("duplicates", [])
+            if not duplicates:
+                return [types.TextContent(type="text", text=f"No duplicates found above {similarity_threshold} similarity threshold")]
+
+            lines = [f"🔍 Found {len(duplicates)} potential duplicate groups (similarity >= {similarity_threshold}):"]
+
+            for i, group in enumerate(duplicates[:10]):
+                lines.append(f"\n📦 Group {i+1} ({len(group.get('memories', []))} memories, similarity: {group.get('similarity', 0):.2f}):")
+                for mem in group.get("memories", [])[:3]:
+                    content_preview = mem.get("content", "")[:60] + "..."
+                    lines.append(f"   • {mem.get('content_hash', 'unknown')[:12]}... : {content_preview}")
+
+            if len(duplicates) > 10:
+                lines.append(f"\n... and {len(duplicates) - 10} more groups")
+
+            lines.append(f"\n💡 Use preview_consolidation to see what would happen before merging.")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error finding duplicates: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error finding duplicates: {str(e)}")]
+
+    async def handle_preview_consolidation(self, arguments: dict) -> List[types.TextContent]:
+        """Preview what would happen if memories were consolidated (dry run)."""
+        content_hashes = arguments.get("content_hashes", [])
+
+        if not content_hashes or len(content_hashes) < 2:
+            return [types.TextContent(type="text", text="Error: At least 2 content_hashes are required")]
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'preview_consolidation'):
+                return [types.TextContent(type="text", text="Error: Consolidation not supported by this storage backend")]
+
+            result = await storage.preview_consolidation(content_hashes)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            preview = result.get("preview", {})
+
+            lines = ["🔮 Consolidation Preview (DRY RUN - no changes made):"]
+
+            lines.append(f"\n📥 Input memories ({len(content_hashes)}):")
+            for mem in preview.get("input_memories", []):
+                lines.append(f"   • {mem.get('content_hash', 'unknown')[:12]}... : {mem.get('content', '')[:60]}...")
+
+            merged = preview.get("merged_result", {})
+            lines.append(f"\n📤 Would create merged memory:")
+            lines.append(f"   Content: {merged.get('content', '')[:200]}...")
+            lines.append(f"   Tags: {', '.join(merged.get('tags', []))}")
+
+            lines.append(f"\n📦 Would archive {len(content_hashes)} memories (recoverable via restore_archived)")
+
+            lines.append(f"\n⚠️ To execute, run safe_consolidate_memories with dry_run=false")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error previewing consolidation: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error previewing consolidation: {str(e)}")]
+
+    async def handle_safe_consolidate_memories(self, arguments: dict) -> List[types.TextContent]:
+        """Safely consolidate (merge) duplicate memories with archival."""
+        content_hashes = arguments.get("content_hashes", [])
+        dry_run = arguments.get("dry_run", True)  # SAFE DEFAULT
+
+        if not content_hashes or len(content_hashes) < 2:
+            return [types.TextContent(type="text", text="Error: At least 2 content_hashes are required")]
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'consolidate_memories'):
+                return [types.TextContent(type="text", text="Error: Consolidation not supported by this storage backend")]
+
+            result = await storage.consolidate_memories(content_hashes, dry_run)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            if dry_run:
+                preview = result.get("preview", {})
+                lines = ["🔮 Consolidation Preview (DRY RUN - no changes made):"]
+                lines.append(f"   Would merge {len(content_hashes)} memories")
+                lines.append(f"   Would archive originals (recoverable)")
+                lines.append(f"\n⚠️ Set dry_run=false to execute")
+                return [types.TextContent(type="text", text="\n".join(lines))]
+
+            # Actual consolidation happened
+            lines = ["✅ Consolidation completed:"]
+            lines.append(f"   Merged {len(content_hashes)} memories")
+            lines.append(f"   New memory hash: {result.get('new_hash', 'unknown')[:12]}...")
+            lines.append(f"   Archived {result.get('archived_count', 0)} original memories")
+            lines.append(f"\n💡 Use restore_archived to recover if needed")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error consolidating memories: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error consolidating memories: {str(e)}")]
+
+    async def handle_restore_archived(self, arguments: dict) -> List[types.TextContent]:
+        """Restore a previously archived memory."""
+        archive_id = arguments.get("archive_id")
+
+        if not archive_id:
+            return [types.TextContent(type="text", text="Error: archive_id is required")]
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'restore_archived'):
+                return [types.TextContent(type="text", text="Error: Archive restore not supported by this storage backend")]
+
+            result = await storage.restore_archived(archive_id)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            restored = result.get("restored_memory", {})
+            return [types.TextContent(
+                type="text",
+                text=f"✅ Memory restored successfully!\n   Hash: {restored.get('content_hash', 'unknown')[:12]}...\n   Content: {restored.get('content', '')[:100]}..."
+            )]
+
+        except Exception as e:
+            logger.error(f"Error restoring archived memory: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error restoring archived memory: {str(e)}")]
+
+    async def handle_list_archived(self, arguments: dict) -> List[types.TextContent]:
+        """List archived memories with optional filtering."""
+        reason = arguments.get("reason")
+        limit = arguments.get("limit", 50)
+
+        try:
+            storage = await self._ensure_storage_initialized()
+
+            if not hasattr(storage, 'list_archived'):
+                return [types.TextContent(type="text", text="Error: Archive listing not supported by this storage backend")]
+
+            result = await storage.list_archived(reason, limit)
+
+            if not result.get("success"):
+                return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
+
+            archived = result.get("archived", [])
+            if not archived:
+                filter_info = f" with reason '{reason}'" if reason else ""
+                return [types.TextContent(type="text", text=f"No archived memories found{filter_info}")]
+
+            lines = [f"📦 Archived Memories ({len(archived)}):"]
+
+            for item in archived[:20]:
+                archived_at = item.get("archived_at", "unknown")
+                reason_str = item.get("archived_reason", "unknown")
+                content_preview = item.get("content", "")[:60] + "..."
+
+                lines.append(f"\n   ID: {item.get('id', 'unknown')}")
+                lines.append(f"   Original hash: {item.get('original_content_hash', 'unknown')[:12]}...")
+                lines.append(f"   Reason: {reason_str}")
+                lines.append(f"   Archived: {archived_at}")
+                lines.append(f"   Content: {content_preview}")
+                lines.append(f"   Restored: {'Yes' if item.get('restored') else 'No'}")
+
+            if len(archived) > 20:
+                lines.append(f"\n... and {len(archived) - 20} more archived memories")
+
+            lines.append(f"\n💡 Use restore_archived with the ID to recover any memory")
+
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error listing archived memories: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error listing archived memories: {str(e)}")]
 
 
 async def async_main():
