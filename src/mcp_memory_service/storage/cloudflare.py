@@ -1104,6 +1104,211 @@ class CloudflareStorage(MemoryStorage):
         if new_tags:
             await self._store_d1_tags(memory_id, new_tags)
     
+    async def update_memory_full(
+        self,
+        content_hash: str,
+        new_content: Optional[str] = None,
+        new_tags: Optional[List[str]] = None,
+        new_memory_type: Optional[str] = None,
+        new_metadata: Optional[Dict[str, Any]] = None,
+        rebuild_graph: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Update a memory with full vector and graph rebuild.
+
+        This method handles:
+        1. Content update → new embedding generated and stored in Vectorize
+        2. Tags/metadata update → Vectorize metadata updated
+        3. Graph rebuild → old auto-generated edges removed, new edges created
+
+        Args:
+            content_hash: Hash of the memory to update
+            new_content: New content (if changing content)
+            new_tags: New tags list
+            new_memory_type: New memory type
+            new_metadata: New metadata dict
+            rebuild_graph: Whether to rebuild graph edges (default True)
+
+        Returns:
+            Dict with success status and details
+        """
+        try:
+            # Get existing memory
+            existing = await self.get_by_hash(content_hash)
+            if not existing:
+                return {"success": False, "error": "Memory not found"}
+
+            content_changed = new_content is not None and new_content != existing.content
+            tags_changed = new_tags is not None
+            metadata_changed = new_metadata is not None or new_memory_type is not None
+
+            updates_made = []
+
+            # 1. Handle content change - requires new embedding
+            if content_changed and new_content is not None:
+                # Generate new embedding
+                new_embedding = await self._generate_embedding(new_content)
+
+                # Update D1 content
+                sql = "UPDATE memories SET content = ?, content_size = ?, updated_at = ?, updated_at_iso = ? WHERE content_hash = ?"
+                now = time.time()
+                now_iso = datetime.now().isoformat()
+                content_size = len(new_content.encode('utf-8'))
+                params = [new_content, content_size, now, now_iso, content_hash]
+
+                payload = {"sql": sql, "params": params}
+                response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+                result = response.json()
+
+                if not result.get("success"):
+                    return {"success": False, "error": f"Failed to update content: {result}"}
+
+                updates_made.append("content")
+
+                # Update Vectorize with new embedding
+                tags_str = ",".join(new_tags if new_tags else existing.tags)
+                memory_type = new_memory_type or existing.memory_type
+                created_at_iso = existing.created_at_iso or datetime.now().isoformat()
+
+                vector_metadata = {
+                    "content_hash": content_hash,
+                    "memory_type": memory_type or "standard",
+                    "tags": tags_str,
+                    "created_at": created_at_iso,
+                    "date": created_at_iso[:10] if created_at_iso else None,
+                    "project": self._extract_tag_value(tags_str, "project"),
+                    "type": memory_type or self._extract_tag_value(tags_str, "type"),
+                    "status": self._extract_tag_value(tags_str, "status"),
+                    "priority": self._extract_tag_value(tags_str, "priority"),
+                    "category": self._extract_tag_value(tags_str, "category"),
+                    "is_important": self._has_tag(tags_str, "important"),
+                    "is_task": self._has_tag(tags_str, "type:task") or memory_type == "task",
+                    "is_error": self._has_tag(tags_str, "type:error") or memory_type == "error",
+                    "is_decision": self._has_tag(tags_str, "type:decision") or memory_type == "decision",
+                }
+
+                await self._store_vectorize_vector(content_hash, new_embedding, vector_metadata)
+                updates_made.append("embedding")
+
+            # 2. Handle tags/metadata changes (even if content didn't change)
+            elif tags_changed or metadata_changed:
+                # Update D1
+                update_fields = []
+                params = []
+
+                if new_memory_type:
+                    update_fields.append("memory_type = ?")
+                    params.append(new_memory_type)
+
+                if new_metadata:
+                    update_fields.append("metadata_json = ?")
+                    params.append(json.dumps(new_metadata))
+
+                # Always update timestamp
+                update_fields.append("updated_at = ?")
+                update_fields.append("updated_at_iso = ?")
+                now = time.time()
+                now_iso = datetime.now().isoformat()
+                params.extend([now, now_iso])
+
+                if update_fields:
+                    sql = f"UPDATE memories SET {', '.join(update_fields)} WHERE content_hash = ?"
+                    params.append(content_hash)
+
+                    payload = {"sql": sql, "params": params}
+                    response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+                    result = response.json()
+
+                    if not result.get("success"):
+                        return {"success": False, "error": f"Failed to update metadata: {result}"}
+
+                # Update tags in D1
+                if tags_changed:
+                    await self._update_memory_tags(content_hash, new_tags)
+                    updates_made.append("tags")
+
+                if new_memory_type:
+                    updates_made.append("memory_type")
+                if new_metadata:
+                    updates_made.append("metadata")
+
+                # Update Vectorize metadata (re-generate embedding only if needed for metadata search)
+                # For now, just update with existing embedding to refresh metadata
+                tags_str = ",".join(new_tags if new_tags else existing.tags)
+                memory_type = new_memory_type or existing.memory_type
+                created_at_iso = existing.created_at_iso or datetime.now().isoformat()
+
+                # Re-generate embedding to ensure Vectorize is in sync
+                embedding = await self._generate_embedding(existing.content)
+
+                vector_metadata = {
+                    "content_hash": content_hash,
+                    "memory_type": memory_type or "standard",
+                    "tags": tags_str,
+                    "created_at": created_at_iso,
+                    "date": created_at_iso[:10] if created_at_iso else None,
+                    "project": self._extract_tag_value(tags_str, "project"),
+                    "type": memory_type or self._extract_tag_value(tags_str, "type"),
+                    "status": self._extract_tag_value(tags_str, "status"),
+                    "priority": self._extract_tag_value(tags_str, "priority"),
+                    "category": self._extract_tag_value(tags_str, "category"),
+                    "is_important": self._has_tag(tags_str, "important"),
+                    "is_task": self._has_tag(tags_str, "type:task") or memory_type == "task",
+                    "is_error": self._has_tag(tags_str, "type:error") or memory_type == "error",
+                    "is_decision": self._has_tag(tags_str, "type:decision") or memory_type == "decision",
+                }
+
+                await self._store_vectorize_vector(content_hash, embedding, vector_metadata)
+                updates_made.append("vectorize_metadata")
+
+            # 3. Rebuild graph edges if requested
+            if rebuild_graph and (content_changed or tags_changed):
+                # Remove old auto-generated edges
+                await self._remove_auto_edges(content_hash)
+                updates_made.append("removed_old_edges")
+
+                # Create new edges based on current content
+                content_for_linking = new_content if (content_changed and new_content) else existing.content
+                if content_for_linking:
+                    await self._auto_link_memory(content_hash, content_for_linking)
+                    updates_made.append("rebuilt_graph")
+
+            logger.info(f"Successfully updated memory {content_hash}: {updates_made}")
+            return {
+                "success": True,
+                "content_hash": content_hash,
+                "updates": updates_made,
+                "message": f"Memory updated: {', '.join(updates_made)}"
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to update memory {content_hash}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _remove_auto_edges(self, content_hash: str) -> int:
+        """Remove auto-generated edges for a memory."""
+        try:
+            # Remove edges where this memory is the source and edge was auto-generated
+            sql = """
+                DELETE FROM memory_edges
+                WHERE source_hash = ?
+                AND metadata_json LIKE '%"auto_generated": true%'
+            """
+            payload = {"sql": sql, "params": [content_hash]}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if not result.get("success"):
+                logger.warning(f"Failed to remove auto edges: {result}")
+                return 0
+
+            logger.info(f"Removed auto-generated edges for {content_hash[:8]}...")
+            return 1
+
+        except Exception as e:
+            logger.error(f"Error removing auto edges: {e}")
+            return 0
+
     async def get_stats(self) -> Dict[str, Any]:
         """Get storage statistics."""
         try:

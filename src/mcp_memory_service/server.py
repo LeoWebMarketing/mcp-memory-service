@@ -1753,6 +1753,63 @@ class MemoryServer:
                             },
                             "required": ["content_hash", "updates"]
                         }
+                    ),
+                    types.Tool(
+                        name="update_memory_full",
+                        description="""Update a memory with full vector and graph rebuild.
+
+                        Unlike update_memory_metadata, this function:
+                        1. Regenerates embedding when content/tags change
+                        2. Updates Vectorize metadata for better filtering
+                        3. Rebuilds graph edges (removes old auto-generated, creates new)
+
+                        Use this when you need the memory's position in vector space
+                        and graph relations to reflect the changes.
+
+                        Examples:
+                        # Change task status (will update Vectorize metadata)
+                        {
+                            "content_hash": "abc123...",
+                            "new_tags": ["project:x", "type:task", "status:completed"]
+                        }
+
+                        # Update content (will regenerate embedding + rebuild graph)
+                        {
+                            "content_hash": "abc123...",
+                            "new_content": "Updated task description..."
+                        }""",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "content_hash": {
+                                    "type": "string",
+                                    "description": "Hash of the memory to update"
+                                },
+                                "new_content": {
+                                    "type": "string",
+                                    "description": "New content (triggers embedding regeneration)"
+                                },
+                                "new_tags": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "New tags list (replaces existing)"
+                                },
+                                "new_memory_type": {
+                                    "type": "string",
+                                    "description": "New memory type"
+                                },
+                                "new_metadata": {
+                                    "type": "object",
+                                    "description": "New metadata dict"
+                                },
+                                "rebuild_graph": {
+                                    "type": "boolean",
+                                    "default": True,
+                                    "description": "Whether to rebuild graph edges (default: true)"
+                                }
+                            },
+                            "required": ["content_hash"]
+                        }
                     )
                 ]
 
@@ -2467,6 +2524,9 @@ class MemoryServer:
                 elif name == "update_memory_metadata":
                     logger.info("Calling handle_update_memory_metadata")
                     return await self.handle_update_memory_metadata(arguments)
+                elif name == "update_memory_full":
+                    logger.info("Calling handle_update_memory_full")
+                    return await self.handle_update_memory_full(arguments)
                 # Consolidation tool handlers
                 elif name == "consolidate_memories":
                     logger.info("Calling handle_consolidate_memories")
@@ -2865,6 +2925,58 @@ class MemoryServer:
                 
         except Exception as e:
             error_msg = f"Error updating memory metadata: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return [types.TextContent(type="text", text=error_msg)]
+
+    async def handle_update_memory_full(self, arguments: dict) -> List[types.TextContent]:
+        """Handle full memory update with vector/graph rebuild."""
+        try:
+            content_hash = arguments.get("content_hash")
+            if not content_hash:
+                return [types.TextContent(type="text", text="Error: content_hash is required")]
+
+            new_content = arguments.get("new_content")
+            new_tags = arguments.get("new_tags")
+            new_memory_type = arguments.get("new_memory_type")
+            new_metadata = arguments.get("new_metadata")
+            rebuild_graph = arguments.get("rebuild_graph", True)
+
+            # Initialize storage lazily when needed
+            storage = await self._ensure_storage_initialized()
+
+            # Check if storage backend supports this method
+            if not hasattr(storage, 'update_memory_full'):
+                return [types.TextContent(
+                    type="text",
+                    text="Error: update_memory_full is only available with Cloudflare backend"
+                )]
+
+            # Call the storage method
+            result = await storage.update_memory_full(
+                content_hash=content_hash,
+                new_content=new_content,
+                new_tags=new_tags,
+                new_memory_type=new_memory_type,
+                new_metadata=new_metadata,
+                rebuild_graph=rebuild_graph
+            )
+
+            if result.get("success"):
+                updates = result.get("updates", [])
+                logger.info(f"Successfully updated memory {content_hash}: {updates}")
+                return [types.TextContent(
+                    type="text",
+                    text=f"✅ Memory updated successfully!\n\nUpdates performed:\n" +
+                         "\n".join(f"  • {u}" for u in updates) +
+                         f"\n\nHash: {content_hash}"
+                )]
+            else:
+                error = result.get("error", "Unknown error")
+                logger.warning(f"Failed to update memory {content_hash}: {error}")
+                return [types.TextContent(type="text", text=f"❌ Failed to update memory: {error}")]
+
+        except Exception as e:
+            error_msg = f"Error updating memory: {str(e)}"
             logger.error(f"{error_msg}\n{traceback.format_exc()}")
             return [types.TextContent(type="text", text=error_msg)]
 
