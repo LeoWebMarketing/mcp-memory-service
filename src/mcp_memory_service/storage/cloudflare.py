@@ -996,12 +996,13 @@ class CloudflareStorage(MemoryStorage):
                 return 0, "No tags provided"
 
             # Build SQL to find memories with ALL tags using GROUP BY and HAVING
-            # This approach is more compatible with D1
+            # Schema: memories <-> memory_tags <-> tags (many-to-many)
             placeholders = ", ".join(["?" for _ in tags])
             sql = f"""
             SELECT m.content_hash
             FROM memories m
-            JOIN tags t ON t.memory_id = m.id
+            JOIN memory_tags mt ON mt.memory_id = m.id
+            JOIN tags t ON t.id = mt.tag_id
             WHERE t.name IN ({placeholders})
             GROUP BY m.id
             HAVING COUNT(DISTINCT t.name) = ?
@@ -1052,11 +1053,12 @@ class CloudflareStorage(MemoryStorage):
             else:
                 end_ts = datetime.now().timestamp() + 86400
 
-            # Build query
+            # Build query - use memory_tags junction table
             if tag:
                 sql = """
                 SELECT m.content_hash FROM memories m
-                JOIN tags t ON t.memory_id = m.id
+                JOIN memory_tags mt ON mt.memory_id = m.id
+                JOIN tags t ON t.id = mt.tag_id
                 WHERE m.created_at >= ? AND m.created_at < ? AND t.name = ?
                 """
                 params = [start_ts, end_ts, tag]
@@ -1102,11 +1104,12 @@ class CloudflareStorage(MemoryStorage):
             before_dt = datetime.strptime(before_date, "%Y-%m-%d")
             before_ts = before_dt.timestamp()
 
-            # Build query
+            # Build query - use memory_tags junction table
             if tag:
                 sql = """
                 SELECT m.content_hash FROM memories m
-                JOIN tags t ON t.memory_id = m.id
+                JOIN memory_tags mt ON mt.memory_id = m.id
+                JOIN tags t ON t.id = mt.tag_id
                 WHERE m.created_at < ? AND t.name = ?
                 """
                 params = [before_ts, tag]
