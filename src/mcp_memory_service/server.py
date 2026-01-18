@@ -4310,12 +4310,13 @@ Memories Archived: {report.memories_archived}"""
 
     async def handle_find_path(self, arguments: dict) -> List[types.TextContent]:
         """Find the shortest path between two memories."""
-        source_hash = arguments.get("source_hash")
-        target_hash = arguments.get("target_hash")
+        # Tool schema uses from_hash/to_hash
+        source_hash = arguments.get("from_hash") or arguments.get("source_hash")
+        target_hash = arguments.get("to_hash") or arguments.get("target_hash")
         max_depth = arguments.get("max_depth", 5)
 
         if not source_hash or not target_hash:
-            return [types.TextContent(type="text", text="Error: source_hash and target_hash are required")]
+            return [types.TextContent(type="text", text="Error: from_hash and to_hash are required")]
 
         try:
             storage = await self._ensure_storage_initialized()

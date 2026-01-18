@@ -208,7 +208,8 @@ class CloudflareStorage(MemoryStorage):
         truncated_text = text[:MAX_EMBEDDING_CHARS] if len(text) > MAX_EMBEDDING_CHARS else text
 
         # Check cache first (use truncated text for cache key)
-        text_hash = hashlib.sha256(truncated_text.encode()).hexdigest()
+        # Use utf-8 encoding with errors='replace' to handle special characters
+        text_hash = hashlib.sha256(truncated_text.encode('utf-8', errors='replace')).hexdigest()
         if text_hash in self._embedding_cache:
             return self._embedding_cache[text_hash]
 
@@ -983,11 +984,159 @@ class CloudflareStorage(MemoryStorage):
             
             logger.info(f"Deleted {deleted_count} memories with tag: {tag}")
             return deleted_count, f"Deleted {deleted_count} memories"
-            
+
         except Exception as e:
             logger.error(f"Failed to delete by tag {tag}: {e}")
             return 0, f"Deletion failed: {str(e)}"
-    
+
+    async def delete_by_all_tags(self, tags: List[str]) -> Tuple[int, str]:
+        """Delete memories that contain ALL of the specified tags."""
+        try:
+            if not tags:
+                return 0, "No tags provided"
+
+            # Build SQL to find memories with ALL tags
+            # Use subqueries to ensure memory has ALL required tags
+            tag_conditions = " AND ".join([
+                f"EXISTS (SELECT 1 FROM tags t WHERE t.memory_id = m.id AND t.name = ?)"
+                for _ in tags
+            ])
+
+            sql = f"""
+            SELECT m.content_hash FROM memories m
+            WHERE {tag_conditions}
+            """
+
+            payload = {"sql": sql, "params": tags}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if not result.get("success"):
+                raise ValueError(f"Failed to find memories with all tags: {result}")
+
+            results = result.get("result", [{}])[0].get("results", [])
+
+            deleted_count = 0
+            for row in results:
+                success, _ = await self.delete(row["content_hash"])
+                if success:
+                    deleted_count += 1
+
+            logger.info(f"Deleted {deleted_count} memories with all tags: {tags}")
+            return deleted_count, f"Deleted {deleted_count} memories"
+
+        except Exception as e:
+            logger.error(f"Failed to delete by all tags {tags}: {e}")
+            return 0, f"Deletion failed: {str(e)}"
+
+    async def delete_by_timeframe(
+        self,
+        start_date: str,
+        end_date: Optional[str] = None,
+        tag: Optional[str] = None
+    ) -> Tuple[int, str]:
+        """Delete memories within a specific timeframe."""
+        try:
+            from datetime import datetime
+
+            # Parse dates (expected format: YYYY-MM-DD)
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            start_ts = start_dt.timestamp()
+
+            if end_date:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                # Include the entire end day
+                end_ts = (end_dt.timestamp() + 86400)  # Add 24 hours
+            else:
+                end_ts = datetime.now().timestamp() + 86400
+
+            # Build query
+            if tag:
+                sql = """
+                SELECT m.content_hash FROM memories m
+                JOIN tags t ON t.memory_id = m.id
+                WHERE m.created_at >= ? AND m.created_at < ? AND t.name = ?
+                """
+                params = [start_ts, end_ts, tag]
+            else:
+                sql = """
+                SELECT content_hash FROM memories
+                WHERE created_at >= ? AND created_at < ?
+                """
+                params = [start_ts, end_ts]
+
+            payload = {"sql": sql, "params": params}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if not result.get("success"):
+                raise ValueError(f"Failed to find memories in timeframe: {result}")
+
+            results = result.get("result", [{}])[0].get("results", [])
+
+            deleted_count = 0
+            for row in results:
+                success, _ = await self.delete(row["content_hash"])
+                if success:
+                    deleted_count += 1
+
+            logger.info(f"Deleted {deleted_count} memories from {start_date} to {end_date or 'now'}")
+            return deleted_count, f"Deleted {deleted_count} memories"
+
+        except Exception as e:
+            logger.error(f"Failed to delete by timeframe: {e}")
+            return 0, f"Deletion failed: {str(e)}"
+
+    async def delete_before_date(
+        self,
+        before_date: str,
+        tag: Optional[str] = None
+    ) -> Tuple[int, str]:
+        """Delete memories before a specific date."""
+        try:
+            from datetime import datetime
+
+            # Parse date (expected format: YYYY-MM-DD)
+            before_dt = datetime.strptime(before_date, "%Y-%m-%d")
+            before_ts = before_dt.timestamp()
+
+            # Build query
+            if tag:
+                sql = """
+                SELECT m.content_hash FROM memories m
+                JOIN tags t ON t.memory_id = m.id
+                WHERE m.created_at < ? AND t.name = ?
+                """
+                params = [before_ts, tag]
+            else:
+                sql = """
+                SELECT content_hash FROM memories
+                WHERE created_at < ?
+                """
+                params = [before_ts]
+
+            payload = {"sql": sql, "params": params}
+            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+            result = response.json()
+
+            if not result.get("success"):
+                raise ValueError(f"Failed to find memories before date: {result}")
+
+            results = result.get("result", [{}])[0].get("results", [])
+
+            deleted_count = 0
+            for row in results:
+                success, _ = await self.delete(row["content_hash"])
+                if success:
+                    deleted_count += 1
+
+            logger.info(f"Deleted {deleted_count} memories before {before_date}")
+            return deleted_count, f"Deleted {deleted_count} memories"
+
+        except Exception as e:
+            logger.error(f"Failed to delete before date: {e}")
+            return 0, f"Deletion failed: {str(e)}"
+
     async def cleanup_duplicates(self) -> Tuple[int, str]:
         """Remove duplicate memories based on content hash."""
         try:
@@ -1897,9 +2046,38 @@ class CloudflareStorage(MemoryStorage):
             Dict with success status and edge_id or error
         """
         try:
+            # Validate edge_type
+            valid_edge_types = ["depends_on", "blocks", "related_to", "parent_of", "references", "derived_from", "consolidated_from"]
+            if edge_type not in valid_edge_types:
+                return {"success": False, "error": f"Invalid edge_type. Must be one of: {valid_edge_types}"}
+
+            # Verify both memories exist before creating edge
+            source_exists = await self.get_by_hash(source_hash)
+            target_exists = await self.get_by_hash(target_hash)
+
+            if not source_exists:
+                return {"success": False, "error": f"Source memory not found: {source_hash}"}
+            if not target_exists:
+                return {"success": False, "error": f"Target memory not found: {target_hash}"}
+
             import uuid
             edge_id = str(uuid.uuid4())
             metadata_json = json.dumps(metadata) if metadata else None
+
+            # First ensure the table exists (in case schema wasn't fully initialized)
+            create_table_sql = """
+            CREATE TABLE IF NOT EXISTS memory_edges (
+                id TEXT PRIMARY KEY,
+                source_hash TEXT NOT NULL,
+                target_hash TEXT NOT NULL,
+                edge_type TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                metadata_json TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(source_hash, target_hash, edge_type)
+            )
+            """
+            await self._retry_request("POST", f"{self.d1_url}/query", json={"sql": create_table_sql})
 
             sql = """
             INSERT INTO memory_edges (id, source_hash, target_hash, edge_type, weight, metadata_json)
@@ -1914,7 +2092,8 @@ class CloudflareStorage(MemoryStorage):
             result = response.json()
 
             if not result.get("success"):
-                return {"success": False, "error": f"Failed to create edge: {result}"}
+                error_msg = result.get("errors", [{}])[0].get("message", str(result)) if result.get("errors") else str(result)
+                return {"success": False, "error": f"Failed to create edge: {error_msg}"}
 
             logger.info(f"Created edge: {source_hash[:8]} --{edge_type}--> {target_hash[:8]}")
             return {"success": True, "edge_id": edge_id}
@@ -2642,8 +2821,8 @@ class CloudflareStorage(MemoryStorage):
             if len(memories) < 2:
                 return {"error": "Need at least 2 memories to consolidate"}
 
-            # Sort by creation date
-            memories.sort(key=lambda m: m.metadata.created_at or 0)
+            # Sort by creation date (created_at is directly on Memory object, not in metadata)
+            memories.sort(key=lambda m: m.created_at or 0)
 
             if merge_strategy == "newest":
                 keep = memories[-1]
@@ -2655,24 +2834,24 @@ class CloudflareStorage(MemoryStorage):
                 keep = memories[-1]
                 archive = memories[:-1]
 
-            # Combine tags
+            # Combine tags (tags is directly on Memory object, not in metadata)
             all_tags = set()
             for m in memories:
-                all_tags.update(m.metadata.tags or [])
+                all_tags.update(m.tags or [])
 
             return {
                 "strategy": merge_strategy,
                 "keep": {
                     "hash": keep.content_hash,
                     "content_preview": keep.content[:200],
-                    "original_tags": keep.metadata.tags,
+                    "original_tags": keep.tags,
                     "merged_tags": list(all_tags)
                 },
                 "archive": [
                     {
                         "hash": m.content_hash,
                         "content_preview": m.content[:100],
-                        "tags": m.metadata.tags
+                        "tags": m.tags
                     }
                     for m in archive
                 ],
