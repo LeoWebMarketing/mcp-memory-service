@@ -1677,7 +1677,7 @@ class CloudflareStorage(MemoryStorage):
         edge_type: str,
         weight: float = 1.0,
         metadata: Optional[Dict[str, Any]] = None
-    ) -> Tuple[bool, str]:
+    ) -> Dict[str, Any]:
         """
         Create a directed edge between two memories.
 
@@ -1689,7 +1689,7 @@ class CloudflareStorage(MemoryStorage):
             metadata: Optional JSON metadata for the edge
 
         Returns:
-            Tuple of (success, message or edge_id)
+            Dict with success status and edge_id or error
         """
         try:
             import uuid
@@ -1709,14 +1709,14 @@ class CloudflareStorage(MemoryStorage):
             result = response.json()
 
             if not result.get("success"):
-                return False, f"Failed to create edge: {result}"
+                return {"success": False, "error": f"Failed to create edge: {result}"}
 
             logger.info(f"Created edge: {source_hash[:8]} --{edge_type}--> {target_hash[:8]}")
-            return True, edge_id
+            return {"success": True, "edge_id": edge_id}
 
         except Exception as e:
             logger.error(f"Error creating edge: {str(e)}")
-            return False, str(e)
+            return {"success": False, "error": str(e)}
 
     async def unlink_memories(
         self,
@@ -1764,7 +1764,7 @@ class CloudflareStorage(MemoryStorage):
         edge_type: Optional[str] = None,
         direction: str = "both",
         depth: int = 1
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         Get memories related to the given memory through edges.
 
@@ -1775,7 +1775,7 @@ class CloudflareStorage(MemoryStorage):
             depth: How many levels to traverse (default 1, max 5)
 
         Returns:
-            List of related memories with edge information
+            Dict with success status and list of related memories
         """
         try:
             depth = min(depth, 5)  # Cap depth for performance
@@ -1836,14 +1836,19 @@ class CloudflareStorage(MemoryStorage):
                 if not current_level:
                     break
 
-            return results
+            return {"success": True, "related": results}
 
         except Exception as e:
             logger.error(f"Error getting related memories: {str(e)}")
-            return []
+            return {"success": False, "error": str(e), "related": []}
 
     async def get_memory_graph(
         self,
+        # Server.py compatibility parameters (positional)
+        center_hash: Optional[str] = None,
+        max_depth: int = 2,
+        edge_types: Optional[List[str]] = None,
+        # Original parameters (keyword)
         project: Optional[str] = None,
         include_completed: bool = True,
         max_nodes: int = 100
@@ -1852,16 +1857,33 @@ class CloudflareStorage(MemoryStorage):
         Get a full graph view of memories for visualization.
 
         Args:
+            center_hash: Optional center node to build graph around (server.py compat)
+            max_depth: Maximum depth for graph traversal (server.py compat)
+            edge_types: Filter by edge types (server.py compat)
             project: Filter by project tag
             include_completed: Include completed tasks
             max_nodes: Maximum number of nodes to return
 
         Returns:
-            Dict with 'nodes' and 'edges' for graph visualization
+            Dict with success status, 'nodes' and 'edges' for graph visualization
         """
         try:
             # Get memories (nodes)
-            if project:
+            if center_hash:
+                # If center_hash provided, get related memories
+                related_result = await self.get_related(center_hash, depth=max_depth)
+                if related_result.get("success"):
+                    # Extract memory hashes from related results
+                    related_hashes = [r.get("content_hash") for r in related_result.get("related", [])]
+                    # Get the center memory and related ones
+                    memories = []
+                    for h in [center_hash] + related_hashes[:max_nodes-1]:
+                        mem = await self.get_by_hash(h)
+                        if mem:
+                            memories.append(mem)
+                else:
+                    memories = await self.get_recent_memories(max_nodes)
+            elif project:
                 memories = await self.search_by_tag([f"project:{project}"])
             else:
                 memories = await self.get_recent_memories(max_nodes)
@@ -1874,25 +1896,23 @@ class CloudflareStorage(MemoryStorage):
                 return m.content if hasattr(m, 'content') else m.get('content', '')
 
             def get_tags(m):
-                if hasattr(m, 'metadata') and hasattr(m.metadata, 'tags'):
-                    return m.metadata.tags or []
+                # Memory objects have tags as direct attribute
+                if hasattr(m, 'tags'):
+                    return m.tags or []
                 elif isinstance(m, dict):
-                    metadata = m.get('metadata', {})
-                    if isinstance(metadata, dict):
-                        return metadata.get('tags', []) or []
-                    elif hasattr(metadata, 'tags'):
-                        return metadata.tags or []
+                    # For dicts, check tags_str first (storage format), then tags
+                    if 'tags_str' in m:
+                        tags_str = m.get('tags_str', '')
+                        return tags_str.split(',') if tags_str else []
+                    return m.get('tags', []) or []
                 return []
 
             def get_type(m):
-                if hasattr(m, 'metadata') and hasattr(m.metadata, 'memory_type'):
-                    return m.metadata.memory_type
+                # Memory objects have memory_type as direct attribute
+                if hasattr(m, 'memory_type'):
+                    return m.memory_type
                 elif isinstance(m, dict):
-                    metadata = m.get('metadata', {})
-                    if isinstance(metadata, dict):
-                        return metadata.get('memory_type')
-                    elif hasattr(metadata, 'memory_type'):
-                        return metadata.memory_type
+                    return m.get('type') or m.get('memory_type')
                 return None
 
             # Filter completed if needed
@@ -1937,7 +1957,12 @@ class CloudflareStorage(MemoryStorage):
                     "tags": get_tags(m)
                 })
 
+            # Add content_hash to nodes for server.py compatibility
+            for node in nodes:
+                node["content_hash"] = node["id"]
+
             return {
+                "success": True,
                 "nodes": nodes,
                 "edges": [
                     {
@@ -1956,14 +1981,14 @@ class CloudflareStorage(MemoryStorage):
 
         except Exception as e:
             logger.error(f"Error getting memory graph: {str(e)}")
-            return {"nodes": [], "edges": [], "stats": {"node_count": 0, "edge_count": 0}}
+            return {"success": False, "error": str(e), "nodes": [], "edges": [], "stats": {"node_count": 0, "edge_count": 0}}
 
     async def find_path(
         self,
         from_hash: str,
         to_hash: str,
         max_depth: int = 5
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         Find the shortest path between two memories through edges.
 
@@ -1973,7 +1998,7 @@ class CloudflareStorage(MemoryStorage):
             max_depth: Maximum path length to search
 
         Returns:
-            List of memories forming the path (empty if no path found)
+            Dict with success status and list of memories forming the path
         """
         try:
             from collections import deque
@@ -2013,17 +2038,17 @@ class CloudflareStorage(MemoryStorage):
                                 memory = await self.get_by_hash(hash_val)
                                 if memory:
                                     path_memories.append(memory.to_dict())
-                            return path_memories
+                            return {"success": True, "path": path_memories}
 
                         if related not in visited:
                             visited.add(related)
                             queue.append((related, path + [related]))
 
-            return []  # No path found
+            return {"success": True, "path": []}  # No path found
 
         except Exception as e:
             logger.error(f"Error finding path: {str(e)}")
-            return []
+            return {"success": False, "error": str(e), "path": []}
 
     # =========================================================================
     # DECAY/REINFORCEMENT (v9.0) - Track memory importance over time
@@ -2071,7 +2096,7 @@ class CloudflareStorage(MemoryStorage):
         threshold: float = 0.5,
         min_age_days: int = 30,
         limit: int = 50
-    ) -> List[Memory]:
+    ) -> Dict[str, Any]:
         """
         Get memories with low strength score for review (NOT auto-deletion).
         This is INFORMATIONAL only - user decides what to do with results.
@@ -2082,36 +2107,61 @@ class CloudflareStorage(MemoryStorage):
             limit: Maximum results to return
 
         Returns:
-            List of weak memories for user review
+            Dict with success status and list of weak memories for user review
         """
         try:
-            from datetime import datetime, timedelta
-            cutoff = (datetime.utcnow() - timedelta(days=min_age_days)).timestamp()
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=min_age_days)).timestamp()
 
-            sql = """
-            SELECT * FROM memories
-            WHERE (strength IS NULL OR strength < ?)
-            AND created_at < ?
-            ORDER BY strength ASC, access_count ASC
-            LIMIT ?
-            """
+            # First try with strength column (v9.0 schema)
+            try:
+                sql = """
+                SELECT * FROM memories
+                WHERE (strength IS NULL OR strength < ?)
+                AND created_at < ?
+                ORDER BY strength ASC, access_count ASC
+                LIMIT ?
+                """
+                payload = {"sql": sql, "params": [threshold, cutoff, limit]}
+                response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+                result = response.json()
+            except Exception:
+                # Fallback: strength column doesn't exist, query by age only
+                sql = """
+                SELECT * FROM memories
+                WHERE created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """
+                payload = {"sql": sql, "params": [cutoff, limit]}
+                response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+                result = response.json()
 
-            payload = {"sql": sql, "params": [threshold, cutoff, limit]}
-            response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
-            result = response.json()
+            # Check for D1 error in response
+            if not result.get("success"):
+                # Try fallback query without strength column
+                sql = """
+                SELECT * FROM memories
+                WHERE created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """
+                payload = {"sql": sql, "params": [cutoff, limit]}
+                response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
+                result = response.json()
 
             memories = []
             if result.get("success") and result.get("result", [{}])[0].get("results"):
                 for row in result["result"][0]["results"]:
                     memory = await self._load_memory_from_row(row)
                     if memory:
-                        memories.append(memory)
+                        memories.append(memory.to_dict())
 
-            return memories
+            return {"success": True, "memories": memories}
 
         except Exception as e:
             logger.error(f"Error getting weak memories: {str(e)}")
-            return []
+            return {"success": False, "error": str(e), "memories": []}
 
     # =========================================================================
     # PROACTIVE RETRIEVAL (v9.0) - Auto-load relevant context
@@ -2121,7 +2171,12 @@ class CloudflareStorage(MemoryStorage):
         self,
         project: Optional[str] = None,
         recent_count: int = 10,
-        important_tags: List[str] = None
+        important_tags: Optional[List[str]] = None,
+        # Server.py compatibility parameters
+        include_in_progress: bool = True,
+        include_recent: bool = True,
+        include_important: bool = True,
+        max_results: int = 10
     ) -> Dict[str, Any]:
         """
         Get comprehensive session context for project start.
@@ -2131,72 +2186,86 @@ class CloudflareStorage(MemoryStorage):
             project: Project name to filter by
             recent_count: Number of recent items to include
             important_tags: Tags to include as important
+            include_in_progress: Whether to include in-progress tasks
+            include_recent: Whether to include recent memories
+            include_important: Whether to include important memories
+            max_results: Maximum results per category
 
         Returns:
-            Dict with categorized memories for session context
+            Dict with success status and categorized memories for session context
         """
         try:
             if important_tags is None:
                 important_tags = ["important", "pinned"]
 
+            # Use max_results if provided, otherwise recent_count
+            limit = max_results if max_results else recent_count
+
             context = {
-                "in_progress_tasks": [],
-                "recent_memories": [],
+                "in_progress": [],
+                "recent": [],
                 "important": [],
                 "blockers": [],
-                "recent_errors": [],
-                "recent_decisions": []
+                "errors": [],
+                "decisions": []
             }
 
             # In-progress tasks
-            in_progress = await self.search_by_tag(["status:in-progress"])
-            if project:
-                in_progress = [m for m in in_progress if f"project:{project}" in (m.metadata.tags or [])]
-            context["in_progress_tasks"] = [m.to_dict() for m in in_progress[:10]]
+            if include_in_progress:
+                in_progress = await self.search_by_tag(["status:in-progress"])
+                if project:
+                    in_progress = [m for m in in_progress if f"project:{project}" in (m.tags or [])]
+                context["in_progress"] = [m.to_dict() for m in in_progress[:limit]]
 
             # Important memories
-            important = await self.search_by_tag(important_tags)
-            if project:
-                important = [m for m in important if f"project:{project}" in (m.metadata.tags or [])]
-            context["important"] = [m.to_dict() for m in important[:10]]
+            if include_important:
+                important = await self.search_by_tag(important_tags)
+                if project:
+                    important = [m for m in important if f"project:{project}" in (m.tags or [])]
+                context["important"] = [m.to_dict() for m in important[:limit]]
 
             # Recent memories for project
-            if project:
-                recent = await self.search_by_tag([f"project:{project}"])
-                context["recent_memories"] = [m.to_dict() for m in recent[:recent_count]]
-            else:
-                recent = await self.get_recent_memories(recent_count)
-                context["recent_memories"] = [m.to_dict() for m in recent]
+            if include_recent:
+                if project:
+                    recent = await self.search_by_tag([f"project:{project}"])
+                    context["recent"] = [m.to_dict() for m in recent[:limit]]
+                else:
+                    recent = await self.get_recent_memories(limit)
+                    context["recent"] = [m.to_dict() for m in recent]
 
             # Blockers
             blockers = await self.search_by_tag(["status:blocked"])
             if project:
-                blockers = [m for m in blockers if f"project:{project}" in (m.metadata.tags or [])]
+                blockers = [m for m in blockers if f"project:{project}" in (m.tags or [])]
             context["blockers"] = [m.to_dict() for m in blockers[:5]]
 
             # Recent errors
             errors = await self.search_by_tag(["type:error"])
             if project:
-                errors = [m for m in errors if f"project:{project}" in (m.metadata.tags or [])]
-            context["recent_errors"] = [m.to_dict() for m in errors[:5]]
+                errors = [m for m in errors if f"project:{project}" in (m.tags or [])]
+            context["errors"] = [m.to_dict() for m in errors[:5]]
 
             # Recent decisions
             decisions = await self.search_by_tag(["type:decision"])
             if project:
-                decisions = [m for m in decisions if f"project:{project}" in (m.metadata.tags or [])]
-            context["recent_decisions"] = [m.to_dict() for m in decisions[:5]]
+                decisions = [m for m in decisions if f"project:{project}" in (m.tags or [])]
+            context["decisions"] = [m.to_dict() for m in decisions[:5]]
 
-            return context
+            return {"success": True, "context": context}
 
         except Exception as e:
             logger.error(f"Error getting session context: {str(e)}")
             return {
-                "in_progress_tasks": [],
-                "recent_memories": [],
-                "important": [],
-                "blockers": [],
-                "recent_errors": [],
-                "recent_decisions": []
+                "success": False,
+                "error": str(e),
+                "context": {
+                    "in_progress": [],
+                    "recent": [],
+                    "important": [],
+                    "blockers": [],
+                    "errors": [],
+                    "decisions": []
+                }
             }
 
     async def get_project_summary(self, project: str) -> Dict[str, Any]:
@@ -2207,17 +2276,20 @@ class CloudflareStorage(MemoryStorage):
             project: Project name
 
         Returns:
-            Dict with project summary statistics
+            Dict with success status and project summary statistics
         """
         try:
             all_memories = await self.search_by_tag([f"project:{project}"])
 
-            # Count by status
+            # Count by status and type
             status_counts = {}
             type_counts = {}
+            tasks_count = 0
+            decisions_count = 0
+            errors_count = 0
 
             for m in all_memories:
-                tags = m.metadata.tags or []
+                tags = m.tags or []
 
                 # Count statuses
                 for tag in tags:
@@ -2226,20 +2298,42 @@ class CloudflareStorage(MemoryStorage):
                         status_counts[status] = status_counts.get(status, 0) + 1
 
                 # Count types
-                mem_type = m.metadata.memory_type or "unknown"
+                mem_type = m.memory_type or "unknown"
                 type_counts[mem_type] = type_counts.get(mem_type, 0) + 1
 
-            return {
-                "project": project,
-                "total_memories": len(all_memories),
-                "by_status": status_counts,
-                "by_type": type_counts,
-                "last_activity": all_memories[0].metadata.created_at_iso if all_memories else None
+                # Count specific types
+                if mem_type == "task" or "type:task" in tags:
+                    tasks_count += 1
+                if mem_type == "decision" or "type:decision" in tags:
+                    decisions_count += 1
+                if mem_type == "error" or "type:error" in tags:
+                    errors_count += 1
+
+            # Get recent decisions
+            recent_decisions = [
+                {"content": m.content, "hash": m.content_hash}
+                for m in all_memories
+                if (m.memory_type == "decision" or "type:decision" in (m.tags or []))
+            ][:5]
+
+            summary = {
+                "stats": {
+                    "total": len(all_memories),
+                    "tasks": tasks_count,
+                    "decisions": decisions_count,
+                    "errors": errors_count
+                },
+                "status_breakdown": status_counts,
+                "type_breakdown": type_counts,
+                "recent_decisions": recent_decisions,
+                "last_activity": all_memories[0].created_at_iso if all_memories else None
             }
+
+            return {"success": True, "summary": summary}
 
         except Exception as e:
             logger.error(f"Error getting project summary: {str(e)}")
-            return {"project": project, "error": str(e)}
+            return {"success": False, "error": str(e), "summary": {}}
 
     # =========================================================================
     # SAFE CONSOLIDATION (v9.0) - Merge duplicates with archive safety net
@@ -2250,7 +2344,7 @@ class CloudflareStorage(MemoryStorage):
         similarity_threshold: float = 0.95,
         max_results: int = 50,
         batch_size: int = 100
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         Find semantically similar memories that might be duplicates.
         READ-ONLY: Does not modify or delete anything.
@@ -2261,7 +2355,7 @@ class CloudflareStorage(MemoryStorage):
             batch_size: Batch size for processing
 
         Returns:
-            List of duplicate pairs with similarity scores
+            Dict with success status and list of duplicate pairs with similarity scores
         """
         try:
             duplicates = []
@@ -2297,25 +2391,25 @@ class CloudflareStorage(MemoryStorage):
                                 "memory1": {
                                     "hash": mem1.content_hash,
                                     "content_preview": mem1.content[:100],
-                                    "created": mem1.metadata.created_at_iso,
-                                    "tags": mem1.metadata.tags
+                                    "created": mem1.created_at_iso,
+                                    "tags": mem1.tags
                                 },
                                 "memory2": {
                                     "hash": mem2.content_hash,
                                     "content_preview": mem2.content[:100],
-                                    "created": mem2.metadata.created_at_iso,
-                                    "tags": mem2.metadata.tags
+                                    "created": mem2.created_at_iso,
+                                    "tags": mem2.tags
                                 },
                                 "similarity": round(similarity, 4)
                             })
                     except Exception:
                         continue
 
-            return duplicates
+            return {"success": True, "duplicates": duplicates}
 
         except Exception as e:
             logger.error(f"Error finding duplicates: {str(e)}")
-            return []
+            return {"success": False, "error": str(e), "duplicates": []}
 
     async def preview_consolidation(
         self,
@@ -2516,8 +2610,10 @@ class CloudflareStorage(MemoryStorage):
 
             # Recreate memory
             tags = json.loads(row["tags_json"]) if row.get("tags_json") else []
+            content = row["content"]
             memory = Memory(
-                content=row["content"],
+                content=content,
+                content_hash=row.get("content_hash") or generate_content_hash(content),
                 tags=tags,
                 memory_type=row.get("memory_type")
             )
@@ -2544,7 +2640,7 @@ class CloudflareStorage(MemoryStorage):
         self,
         consolidated_into: Optional[str] = None,
         limit: int = 50
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         List archived memories for review.
 
@@ -2553,7 +2649,7 @@ class CloudflareStorage(MemoryStorage):
             limit: Maximum results
 
         Returns:
-            List of archived memory info
+            Dict with success status and list of archived memory info
         """
         try:
             if consolidated_into:
@@ -2581,25 +2677,26 @@ class CloudflareStorage(MemoryStorage):
             response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
             result = response.json()
 
+            archived = []
             if result.get("success") and result.get("result", [{}])[0].get("results"):
-                return [
+                archived = [
                     {
                         "archive_id": row["id"],
                         "original_hash": row["original_content_hash"],
                         "content_preview": row["content"][:100] if row.get("content") else "",
                         "type": row.get("memory_type"),
                         "archived_at": row.get("archived_at"),
-                        "reason": row.get("archived_reason"),
+                        "archived_reason": row.get("archived_reason"),
                         "consolidated_into": row.get("consolidated_into")
                     }
                     for row in result["result"][0]["results"]
                 ]
 
-            return []
+            return {"success": True, "archived": archived}
 
         except Exception as e:
             logger.error(f"Error listing archived memories: {str(e)}")
-            return []
+            return {"success": False, "error": str(e), "archived": []}
 
     # =========================================================================
     # AUTO-GRAPH BUILDING (v9.0) - Build relationships for existing memories
@@ -2659,7 +2756,7 @@ class CloudflareStorage(MemoryStorage):
         max_memories: int = 1000,
         max_edges_per_memory: int = 5,
         dry_run: bool = True,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         Build graph relationships for existing memories based on semantic similarity.

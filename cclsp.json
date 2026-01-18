@@ -1,0 +1,52 @@
+{
+  "name": "lsp-py",
+  "description": "Python LSP for MCP Memory Service",
+  "mcpServers": {},
+  "lsp": {
+    "python": {
+      "command": "pylsp",
+      "args": [],
+      "languages": ["python"],
+      "initializationOptions": {
+        "pylsp": {
+          "plugins": {
+            "pycodestyle": {
+              "enabled": true,
+              "maxLineLength": 120
+            },
+            "pyflakes": {
+              "enabled": true
+            },
+            "pylint": {
+              "enabled": false
+            },
+            "rope_completion": {
+              "enabled": true
+            },
+            "jedi_completion": {
+              "enabled": true,
+              "include_params": true,
+              "fuzzy": true
+            },
+            "jedi_definition": {
+              "enabled": true,
+              "follow_imports": true
+            },
+            "jedi_hover": {
+              "enabled": true
+            },
+            "jedi_references": {
+              "enabled": true
+            },
+            "jedi_signature_help": {
+              "enabled": true
+            },
+            "jedi_symbols": {
+              "enabled": true
+            }
+          }
+        }
+      }
+    }
+  }
+}

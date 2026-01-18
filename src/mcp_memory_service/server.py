@@ -4243,8 +4243,9 @@ Memories Archived: {report.memories_archived}"""
 
     async def handle_get_weak_memories(self, arguments: dict) -> List[types.TextContent]:
         """Get memories with low strength scores (candidates for review)."""
-        threshold = arguments.get("threshold", 0.3)
-        limit = arguments.get("limit", 20)
+        threshold = arguments.get("threshold", 0.5)
+        min_age_days = arguments.get("min_age_days", 30)
+        limit = arguments.get("limit", 50)
 
         try:
             storage = await self._ensure_storage_initialized()
@@ -4252,7 +4253,11 @@ Memories Archived: {report.memories_archived}"""
             if not hasattr(storage, 'get_weak_memories'):
                 return [types.TextContent(type="text", text="Error: Decay scoring not supported by this storage backend")]
 
-            result = await storage.get_weak_memories(threshold, limit)
+            result = await storage.get_weak_memories(
+                threshold=threshold,
+                min_age_days=min_age_days,
+                limit=limit
+            )
 
             if not result.get("success"):
                 return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
@@ -4406,8 +4411,8 @@ Memories Archived: {report.memories_archived}"""
 
     async def handle_find_duplicate_memories_safe(self, arguments: dict) -> List[types.TextContent]:
         """Find semantically similar (potentially duplicate) memories."""
-        similarity_threshold = arguments.get("similarity_threshold", 0.9)
-        limit = arguments.get("limit", 50)
+        similarity_threshold = arguments.get("similarity_threshold", 0.95)
+        max_results = arguments.get("max_results", 50)
 
         try:
             storage = await self._ensure_storage_initialized()
@@ -4415,7 +4420,10 @@ Memories Archived: {report.memories_archived}"""
             if not hasattr(storage, 'find_duplicate_memories'):
                 return [types.TextContent(type="text", text="Error: Duplicate detection not supported by this storage backend")]
 
-            result = await storage.find_duplicate_memories(similarity_threshold, limit)
+            result = await storage.find_duplicate_memories(
+                similarity_threshold=similarity_threshold,
+                max_results=max_results
+            )
 
             if not result.get("success"):
                 return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
@@ -4424,16 +4432,23 @@ Memories Archived: {report.memories_archived}"""
             if not duplicates:
                 return [types.TextContent(type="text", text=f"No duplicates found above {similarity_threshold} similarity threshold")]
 
-            lines = [f"🔍 Found {len(duplicates)} potential duplicate groups (similarity >= {similarity_threshold}):"]
+            lines = [f"🔍 Found {len(duplicates)} potential duplicate pairs (similarity >= {similarity_threshold}):"]
 
-            for i, group in enumerate(duplicates[:10]):
-                lines.append(f"\n📦 Group {i+1} ({len(group.get('memories', []))} memories, similarity: {group.get('similarity', 0):.2f}):")
-                for mem in group.get("memories", [])[:3]:
-                    content_preview = mem.get("content", "")[:60] + "..."
-                    lines.append(f"   • {mem.get('content_hash', 'unknown')[:12]}... : {content_preview}")
+            for i, pair in enumerate(duplicates[:10]):
+                similarity = pair.get("similarity", 0)
+                mem1 = pair.get("memory1", {})
+                mem2 = pair.get("memory2", {})
+
+                lines.append(f"\n📦 Pair {i+1} (similarity: {similarity:.4f}):")
+                lines.append(f"   Memory 1: {mem1.get('hash', 'unknown')[:12]}...")
+                lines.append(f"     Content: {mem1.get('content_preview', '')[:60]}...")
+                lines.append(f"     Tags: {', '.join(mem1.get('tags', []))}")
+                lines.append(f"   Memory 2: {mem2.get('hash', 'unknown')[:12]}...")
+                lines.append(f"     Content: {mem2.get('content_preview', '')[:60]}...")
+                lines.append(f"     Tags: {', '.join(mem2.get('tags', []))}")
 
             if len(duplicates) > 10:
-                lines.append(f"\n... and {len(duplicates) - 10} more groups")
+                lines.append(f"\n... and {len(duplicates) - 10} more pairs")
 
             lines.append(f"\n💡 Use preview_consolidation to see what would happen before merging.")
 
@@ -4554,7 +4569,7 @@ Memories Archived: {report.memories_archived}"""
 
     async def handle_list_archived(self, arguments: dict) -> List[types.TextContent]:
         """List archived memories with optional filtering."""
-        reason = arguments.get("reason")
+        consolidated_into = arguments.get("consolidated_into")
         limit = arguments.get("limit", 50)
 
         try:
@@ -4563,14 +4578,14 @@ Memories Archived: {report.memories_archived}"""
             if not hasattr(storage, 'list_archived'):
                 return [types.TextContent(type="text", text="Error: Archive listing not supported by this storage backend")]
 
-            result = await storage.list_archived(reason, limit)
+            result = await storage.list_archived(consolidated_into, limit)
 
             if not result.get("success"):
                 return [types.TextContent(type="text", text=f"Error: {result.get('error', 'Unknown error')}")]
 
             archived = result.get("archived", [])
             if not archived:
-                filter_info = f" with reason '{reason}'" if reason else ""
+                filter_info = f" consolidated into '{consolidated_into}'" if consolidated_into else ""
                 return [types.TextContent(type="text", text=f"No archived memories found{filter_info}")]
 
             lines = [f"📦 Archived Memories ({len(archived)}):"]
@@ -4578,14 +4593,14 @@ Memories Archived: {report.memories_archived}"""
             for item in archived[:20]:
                 archived_at = item.get("archived_at", "unknown")
                 reason_str = item.get("archived_reason", "unknown")
-                content_preview = item.get("content", "")[:60] + "..."
+                content_preview = item.get("content_preview", "")[:60] + "..."
 
-                lines.append(f"\n   ID: {item.get('id', 'unknown')}")
-                lines.append(f"   Original hash: {item.get('original_content_hash', 'unknown')[:12]}...")
+                lines.append(f"\n   ID: {item.get('archive_id', 'unknown')}")
+                lines.append(f"   Original hash: {item.get('original_hash', 'unknown')[:12]}...")
                 lines.append(f"   Reason: {reason_str}")
                 lines.append(f"   Archived: {archived_at}")
                 lines.append(f"   Content: {content_preview}")
-                lines.append(f"   Restored: {'Yes' if item.get('restored') else 'No'}")
+                lines.append(f"   Consolidated into: {item.get('consolidated_into', 'N/A')}")
 
             if len(archived) > 20:
                 lines.append(f"\n... and {len(archived) - 20} more archived memories")
