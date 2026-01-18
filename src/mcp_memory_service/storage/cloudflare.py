@@ -236,7 +236,32 @@ class CloudflareStorage(MemoryStorage):
             logger.error(f"Failed to generate embedding with Workers AI: {e}")
             # TODO: Implement fallback to local sentence-transformers
             raise ValueError(f"Embedding generation failed: {e}")
-    
+
+    async def get_raw_embedding(self, content: str) -> Dict[str, Any]:
+        """
+        Get raw embedding vector for content using Workers AI.
+
+        Args:
+            content: Text to generate embedding for
+
+        Returns:
+            Dict with status, embedding vector, dimension, and model info
+        """
+        try:
+            embedding = await self._generate_embedding(content)
+            return {
+                "status": "success",
+                "embedding": embedding,
+                "dimension": len(embedding),
+                "model": self.embedding_model,
+                "backend": "cloudflare"
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e)
+            }
+
     async def initialize(self) -> None:
         """Initialize the Cloudflare storage backend."""
         if self._initialized:

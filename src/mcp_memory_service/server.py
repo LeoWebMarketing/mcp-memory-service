@@ -3242,23 +3242,20 @@ Memories Archived: {report.memories_archived}"""
             # Initialize storage lazily when needed
             storage = await self._ensure_storage_initialized()
 
-            # Check if Cloudflare backend - doesn't support local embedding extraction
-            storage_type = type(storage).__name__
-            if storage_type in ("CloudflareStorage", "HybridStorage"):
-                return [types.TextContent(
-                    type="text",
-                    text=f"get_raw_embedding is not available for {storage_type}.\n\n"
-                         f"Cloudflare uses Workers AI (@cf/baai/bge-base-en-v1.5) for embeddings "
-                         f"which are generated server-side and stored directly in Vectorize index.\n\n"
-                         f"This debug tool only works with local SQLite-vec backend."
-                )]
-
-            from .utils.debug import get_raw_embedding
-            result = await asyncio.to_thread(get_raw_embedding, storage, content)
+            # Check if storage has async get_raw_embedding method (Cloudflare/Hybrid)
+            if hasattr(storage, 'get_raw_embedding') and asyncio.iscoroutinefunction(storage.get_raw_embedding):
+                result = await storage.get_raw_embedding(content)
+            else:
+                # Fallback to sync debug utility for SQLite-vec
+                from .utils.debug import get_raw_embedding
+                result = await asyncio.to_thread(get_raw_embedding, storage, content)
 
             if result["status"] == "success":
                 embedding = result["embedding"]
                 dimension = result["dimension"]
+                model = result.get("model", "unknown")
+                backend = result.get("backend", "local")
+
                 # Show first 10 and last 10 values for readability
                 if len(embedding) > 20:
                     embedding_str = f"[{', '.join(f'{x:.6f}' for x in embedding[:10])}, ..., {', '.join(f'{x:.6f}' for x in embedding[-10:])}]"
@@ -3268,6 +3265,8 @@ Memories Archived: {report.memories_archived}"""
                 return [types.TextContent(
                     type="text",
                     text=f"Embedding generated successfully:\n"
+                         f"Model: {model}\n"
+                         f"Backend: {backend}\n"
                          f"Dimension: {dimension}\n"
                          f"Vector: {embedding_str}"
                 )]
