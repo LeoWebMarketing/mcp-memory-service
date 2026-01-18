@@ -3833,16 +3833,15 @@ Memories Archived: {report.memories_archived}"""
 
     async def handle_delete_by_timeframe(self, arguments: dict) -> List[types.TextContent]:
         """Handle delete by timeframe requests."""
-        from datetime import datetime
-        
         try:
             # Initialize storage lazily when needed
             storage = await self._ensure_storage_initialized()
-            
-            start_date = datetime.fromisoformat(arguments["start_date"]).date()
-            end_date = datetime.fromisoformat(arguments.get("end_date", arguments["start_date"])).date()
+
+            # Pass date strings directly - storage function handles parsing
+            start_date = arguments["start_date"]
+            end_date = arguments.get("end_date")
             tag = arguments.get("tag")
-            
+
             count, message = await storage.delete_by_timeframe(start_date, end_date, tag)
             return [types.TextContent(
                 type="text",
@@ -3857,15 +3856,14 @@ Memories Archived: {report.memories_archived}"""
 
     async def handle_delete_before_date(self, arguments: dict) -> List[types.TextContent]:
         """Handle delete before date requests."""
-        from datetime import datetime
-        
         try:
             # Initialize storage lazily when needed
             storage = await self._ensure_storage_initialized()
-            
-            before_date = datetime.fromisoformat(arguments["before_date"]).date()
+
+            # Pass date string directly - storage function handles parsing
+            before_date = arguments["before_date"]
             tag = arguments.get("tag")
-            
+
             count, message = await storage.delete_before_date(before_date, tag)
             return [types.TextContent(
                 type="text",
