@@ -1,0 +1,19 @@
+name = "mcp-memory-api"
+main = "worker.js"
+compatibility_date = "2024-11-12"
+workers_dev = true
+
+# Vectorize binding
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "mcp-memory-index"
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "mcp-memory-main"
+database_id = "9f82c766-ef40-4b56-b447-969bd1929f5f"
+
+# Workers AI binding for embeddings
+[ai]
+binding = "AI"

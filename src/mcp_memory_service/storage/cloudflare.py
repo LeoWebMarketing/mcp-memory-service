@@ -1841,23 +1841,59 @@ class CloudflareStorage(MemoryStorage):
             else:
                 memories = await self.get_recent_memories(max_nodes)
 
+            # Helper functions to handle both Memory objects and dicts
+            def get_content_hash(m):
+                return m.content_hash if hasattr(m, 'content_hash') else m.get('content_hash')
+
+            def get_content(m):
+                return m.content if hasattr(m, 'content') else m.get('content', '')
+
+            def get_tags(m):
+                if hasattr(m, 'metadata') and hasattr(m.metadata, 'tags'):
+                    return m.metadata.tags or []
+                elif isinstance(m, dict):
+                    metadata = m.get('metadata', {})
+                    if isinstance(metadata, dict):
+                        return metadata.get('tags', []) or []
+                    elif hasattr(metadata, 'tags'):
+                        return metadata.tags or []
+                return []
+
+            def get_type(m):
+                if hasattr(m, 'metadata') and hasattr(m.metadata, 'memory_type'):
+                    return m.metadata.memory_type
+                elif isinstance(m, dict):
+                    metadata = m.get('metadata', {})
+                    if isinstance(metadata, dict):
+                        return metadata.get('memory_type')
+                    elif hasattr(metadata, 'memory_type'):
+                        return metadata.memory_type
+                return None
+
+            # Filter completed if needed
             if not include_completed:
-                memories = [m for m in memories if "status:completed" not in (m.metadata.tags or [])]
+                memories = [m for m in memories if "status:completed" not in get_tags(m)]
 
             memories = memories[:max_nodes]
 
-            # Get content hashes of our nodes
-            node_hashes = {m.content_hash for m in memories}
+            # Handle empty case
+            if not memories:
+                return {"nodes": [], "edges": [], "stats": {"node_count": 0, "edge_count": 0}}
 
-            # Get all edges between these nodes
-            placeholders = ",".join(["?" for _ in node_hashes])
+            # Get content hashes of our nodes
+            node_hashes = [get_content_hash(m) for m in memories if get_content_hash(m)]
+
+            if not node_hashes:
+                return {"nodes": [], "edges": [], "stats": {"node_count": 0, "edge_count": 0}}
+
+            # Get all edges between these nodes using quoted hashes (safer than params for large lists)
+            quoted_hashes = ",".join([f"'{h}'" for h in node_hashes])
             sql = f"""
             SELECT * FROM memory_edges
-            WHERE source_hash IN ({placeholders}) AND target_hash IN ({placeholders})
+            WHERE source_hash IN ({quoted_hashes}) AND target_hash IN ({quoted_hashes})
             """
-            params = list(node_hashes) + list(node_hashes)
 
-            payload = {"sql": sql, "params": params}
+            payload = {"sql": sql}
             response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
             result = response.json()
 
@@ -1865,16 +1901,19 @@ class CloudflareStorage(MemoryStorage):
             if result.get("success") and result.get("result", [{}])[0].get("results"):
                 edges = result["result"][0]["results"]
 
+            # Build nodes list
+            nodes = []
+            for m in memories:
+                content = get_content(m)
+                nodes.append({
+                    "id": get_content_hash(m),
+                    "content": content[:100] + "..." if len(content) > 100 else content,
+                    "type": get_type(m),
+                    "tags": get_tags(m)
+                })
+
             return {
-                "nodes": [
-                    {
-                        "id": m.content_hash,
-                        "content": m.content[:100] + "..." if len(m.content) > 100 else m.content,
-                        "type": m.metadata.memory_type,
-                        "tags": m.metadata.tags
-                    }
-                    for m in memories
-                ],
+                "nodes": nodes,
                 "edges": [
                     {
                         "source": e["source_hash"],
