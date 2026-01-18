@@ -995,19 +995,21 @@ class CloudflareStorage(MemoryStorage):
             if not tags:
                 return 0, "No tags provided"
 
-            # Build SQL to find memories with ALL tags
-            # Use subqueries to ensure memory has ALL required tags
-            tag_conditions = " AND ".join([
-                f"EXISTS (SELECT 1 FROM tags t WHERE t.memory_id = m.id AND t.name = ?)"
-                for _ in tags
-            ])
-
+            # Build SQL to find memories with ALL tags using GROUP BY and HAVING
+            # This approach is more compatible with D1
+            placeholders = ", ".join(["?" for _ in tags])
             sql = f"""
-            SELECT m.content_hash FROM memories m
-            WHERE {tag_conditions}
+            SELECT m.content_hash
+            FROM memories m
+            JOIN tags t ON t.memory_id = m.id
+            WHERE t.name IN ({placeholders})
+            GROUP BY m.id
+            HAVING COUNT(DISTINCT t.name) = ?
             """
 
-            payload = {"sql": sql, "params": tags}
+            # Parameters: all tag names + count of tags
+            params = tags + [len(tags)]
+            payload = {"sql": sql, "params": params}
             response = await self._retry_request("POST", f"{self.d1_url}/query", json=payload)
             result = response.json()
 
