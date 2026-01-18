@@ -3242,6 +3242,17 @@ Memories Archived: {report.memories_archived}"""
             # Initialize storage lazily when needed
             storage = await self._ensure_storage_initialized()
 
+            # Check if Cloudflare backend - doesn't support local embedding extraction
+            storage_type = type(storage).__name__
+            if storage_type in ("CloudflareStorage", "HybridStorage"):
+                return [types.TextContent(
+                    type="text",
+                    text=f"get_raw_embedding is not available for {storage_type}.\n\n"
+                         f"Cloudflare uses Workers AI (@cf/baai/bge-base-en-v1.5) for embeddings "
+                         f"which are generated server-side and stored directly in Vectorize index.\n\n"
+                         f"This debug tool only works with local SQLite-vec backend."
+                )]
+
             from .utils.debug import get_raw_embedding
             result = await asyncio.to_thread(get_raw_embedding, storage, content)
 
